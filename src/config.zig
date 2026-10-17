@@ -30,6 +30,19 @@ pub const Config = struct {
     listen: []const std.Io.net.IpAddress,
     /// Zone file paths as written; relative ones are relative to annai.toml.
     zones: []const []const u8,
+    /// uchi only; absent means names outside the zones are REFUSED.
+    forwarding: ?Forwarding = null,
+};
+
+/// `[forwarding]` (ADR 0008).
+pub const Forwarding = struct {
+    /// Port 53, tried in order.
+    upstreams: []const std.Io.net.IpAddress,
+    /// Clamps of the positive cache lifetime; negative answers only get `max_ttl` (RFC 2308).
+    min_ttl: u32 = 0,
+    max_ttl: u32 = 86400,
+    /// Hard cap on the cache: packet bytes plus per-entry overhead, LRU eviction beyond it.
+    cache_bytes: usize = 16 << 20,
 };
 
 fn parse(a: Allocator, text: []const u8, d: *Diag) Error!Table {
@@ -120,14 +133,23 @@ pub fn checkConfig(a: Allocator, text: []const u8, d: *Diag) Error!Config {
     }
 
     // ADR 0002: configuration that does not match the mode is an error.
+    var forwarding: ?Forwarding = null;
     if (root.get("forwarding")) |v| {
         if (mode != .uchi) return d.fail("forwarding: only allowed in uchi mode", .{});
         const t = try table(v, "forwarding", d);
-        try checkKeys(t, &.{"upstreams"}, "forwarding", d);
+        try checkKeys(t, &.{ "upstreams", "min_ttl", "max_ttl", "cache_bytes" }, "forwarding", d);
+        var upstreams: std.ArrayList(std.Io.net.IpAddress) = .empty;
         for (try array(try need(t, "upstreams", "forwarding", d), "forwarding.upstreams", d)) |u| {
             const s = try string(u, "forwarding.upstreams", d);
-            _ = std.Io.net.IpAddress.parse(s, 53) catch return d.fail("forwarding.upstreams: \"{s}\" is not an IP address", .{s});
+            try upstreams.append(a, std.Io.net.IpAddress.parse(s, 53) catch return d.fail("forwarding.upstreams: \"{s}\" is not an IP address", .{s}));
         }
+        var f: Forwarding = .{ .upstreams = upstreams.items };
+        // RFC 2181: TTLs are 31 bits.
+        if (t.get("min_ttl")) |x| f.min_ttl = try int(u31, x, "forwarding.min_ttl", d);
+        if (t.get("max_ttl")) |x| f.max_ttl = try int(u31, x, "forwarding.max_ttl", d);
+        if (t.get("cache_bytes")) |x| f.cache_bytes = try int(usize, x, "forwarding.cache_bytes", d);
+        if (f.min_ttl > f.max_ttl) return d.fail("forwarding: min_ttl {d} is above max_ttl {d}", .{ f.min_ttl, f.max_ttl });
+        forwarding = f;
     }
     if (root.get("update")) |v| {
         if (mode != .soto) return d.fail("update: only allowed in soto mode", .{});
@@ -145,7 +167,7 @@ pub fn checkConfig(a: Allocator, text: []const u8, d: *Diag) Error!Config {
             if (!std.fs.path.isAbsolute(path)) return d.fail("update.keys: secret_file \"{s}\" is not absolute", .{path});
         }
     }
-    return .{ .mode = mode, .listen = listen.items, .zones = zones.items };
+    return .{ .mode = mode, .listen = listen.items, .zones = zones.items, .forwarding = forwarding };
 }
 
 const record_types = .{ "a", "aaaa", "cname", "ns", "ptr", "mx", "srv", "txt" };
@@ -415,6 +437,10 @@ test "annai.toml" {
     const uchi = "mode = \"uchi\"\nlisten = [\"0.0.0.0:53\", \"[::]:53\"]\nzones = [\"uchi.toml\"]\n";
     const soto = "mode = \"soto\"\nlisten = [\"192.0.2.1:53\"]\n";
     try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\", \"2620:fe::fe\"]", null);
+    try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\nmin_ttl = 30\nmax_ttl = 3600\ncache_bytes = 1048576", null);
+    try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\nmin_ttl = 60\nmax_ttl = 30", "min_ttl 60 is above max_ttl 30");
+    try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\nmax_ttl = 2147483648", "out of range");
+    try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\ncache_bytes = -1", "out of range");
     try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/run/secrets/k\"", null);
 
     try expectConfig("listen = [\"0.0.0.0:53\"]", "missing \"mode\"");

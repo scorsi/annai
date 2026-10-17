@@ -3,6 +3,14 @@
   services.annai = {
     enable = true;
     mode = "uchi";
+    # ADR 0005: PTRs for kekkai's ranges, generated from the <node>.kekkai A/AAAA records below.
+    reverse = {
+      zone = "uchi.example.org.";
+      prefixes = [
+        "10.100.0.0/16"
+        "fd12:3456:789a::/48"
+      ];
+    };
     zones."uchi.example.org." = {
       ttl = 300;
       serial = 1760400000;

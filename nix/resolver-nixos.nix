@@ -1,6 +1,7 @@
 # NixOS resolver client (ADR 0010): annai as the per-link DNS server of the interface that reaches
-# it, in systemd-resolved, with the internal zone as search and routing domains. Only names under
-# the zone go to annai until M2 makes it the resolver for everything.
+# it, in systemd-resolved, with the internal zone as search domains. Clients point all their
+# queries at the uchi instance (ADR 0002): the `~.` routing domain and the default route send
+# every name to annai, not only those under the zone.
 {
   config,
   lib,
@@ -27,7 +28,7 @@ in
     # Applied whenever the link appears, whoever manages it; a manager that rewrites the link's
     # DNS settings afterwards (networkd, NetworkManager) wins, which is a deployment concern.
     systemd.services.annai-resolver = {
-      description = "annai as the resolver of ${cfg.domain} on ${cfg.interface}";
+      description = "annai as the resolver of ${cfg.interface}, search domains under ${cfg.domain}";
       bindsTo = [ device ];
       after = [
         device
@@ -41,8 +42,8 @@ in
       };
       script = ''
         ${resolvectl} dns ${cfg.interface} ${cfg.address}
-        ${resolvectl} domain ${cfg.interface} ${cfg.domain} kekkai.${cfg.domain}
-        ${resolvectl} default-route ${cfg.interface} false
+        ${resolvectl} domain ${cfg.interface} ${cfg.domain} kekkai.${cfg.domain} '~.'
+        ${resolvectl} default-route ${cfg.interface} true
       '';
     };
   };

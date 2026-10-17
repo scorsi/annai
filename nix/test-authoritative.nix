@@ -17,6 +17,8 @@ pkgs.testers.runNixOSTest {
         services.annai.zones."uchi.example.org.".names.big.txt = map (
           _: lib.concatStrings (lib.replicate 255 "x")
         ) (lib.range 1 8);
+        # No forwarding (no Internet in the sandbox): names outside the zones stay REFUSED.
+        services.annai.forwarding.upstreams = [ ];
         networking.firewall.allowedUDPPorts = [ 53 ];
         networking.firewall.allowedTCPPorts = [ 53 ];
       };

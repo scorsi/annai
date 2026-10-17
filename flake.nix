@@ -141,6 +141,7 @@
         # The integration test of ADR 0011 (VMs: Linux only).
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
           authoritative = import ./nix/test-authoritative.nix { inherit self pkgs; };
+          forwarding = import ./nix/test-forwarding.nix { inherit self pkgs; };
         }
       );
 

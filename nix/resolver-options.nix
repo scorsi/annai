@@ -1,7 +1,7 @@
 # Options shared by the NixOS and nix-darwin resolver client modules (ADR 0010).
 { lib }:
 {
-  enable = lib.mkEnableOption "resolving the internal zone through annai";
+  enable = lib.mkEnableOption "resolving every name through annai";
 
   address = lib.mkOption {
     type = lib.types.str;
@@ -14,7 +14,7 @@
     example = "uchi.example.org";
     description = ''
       The internal zone. It and `kekkai.<domain>` are pushed as search domains (ADR 0005), so
-      `<service>` and `<node>` resolve unqualified; queries under it go to {option}`address`.
+      `<service>` and `<node>` resolve unqualified. Every query goes to {option}`address`.
     '';
   };
 }

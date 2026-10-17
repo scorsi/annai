@@ -17,16 +17,30 @@ const max_cname_hops = 8;
 
 pub const Transport = enum { udp, tcp };
 
+/// A query for a name outside the local zones, for the caller to forward (uchi mode, ADR 0008).
+pub const Forward = struct {
+    id: u16,
+    rd: bool,
+    /// The client's question, case kept; borrows the query packet and the arena.
+    question: wire.Question,
+    /// The OPT to echo, if the client sent one.
+    opt: ?wire.Opt,
+    /// Bytes the transport allows for the answer.
+    limit: usize,
+};
+
 /// Writes the response to `query` into `out` and returns its length, or null when the packet
-/// deserves no answer (shorter than a header, or itself a response).
-pub fn respond(arena: std.mem.Allocator, zones: []const zone.Zone, query: []const u8, out: []u8, transport: Transport) ?usize {
+/// deserves no answer (shorter than a header, or itself a response). With `forward`, a valid
+/// query outside the zones is not REFUSED: it is stored there and null is returned.
+pub fn respond(arena: std.mem.Allocator, zones: []const zone.Zone, query: []const u8, out: []u8, transport: Transport, forward: ?*?Forward) ?usize {
     if (query.len < 12) return null;
     const id = std.mem.readInt(u16, query[0..2], .big);
     const qflags: wire.Flags = @bitCast(std.mem.readInt(u16, query[2..4], .big));
     if (qflags.qr) return null;
 
     var r: Response = .{
-        .flags = .{ .qr = true, .opcode = qflags.opcode, .rd = qflags.rd },
+        // A forwarding server offers recursion on every answer, local ones included (RFC 1035 §4.1.1).
+        .flags = .{ .qr = true, .opcode = qflags.opcode, .rd = qflags.rd, .ra = forward != null },
         .limit = if (transport == .tcp) out.len else min_udp_payload,
     };
     const msg = wire.Message.parse(arena, query) catch |e| switch (e) {
@@ -51,7 +65,11 @@ pub fn respond(arena: std.mem.Allocator, zones: []const zone.Zone, query: []cons
     var lowered: [255]u8 = undefined;
     @memcpy(lowered[0..q.name.len], q.name);
     const qname = zone.lower(lowered[0..q.name.len]);
-    const z = zone.find(zones, qname) orelse return r.finish(id, out, .refused);
+    const z = zone.find(zones, qname) orelse {
+        const f = forward orelse return r.finish(id, out, .refused);
+        f.* = .{ .id = id, .rd = qflags.rd, .question = q, .opt = r.opt, .limit = r.limit };
+        return null;
+    };
     r.flags.aa = true;
 
     if (q.type == .any) {
@@ -77,6 +95,26 @@ pub fn respond(arena: std.mem.Allocator, zones: []const zone.Zone, query: []cons
     }
 }
 
+/// The answer to a forwarded query from a validated upstream response, every TTL set to `ttl`
+/// (the remaining cache lifetime); a null or unparsable `upstream` is SERVFAIL. RA=1, AA=0 (ADR 0008).
+pub fn forwarded(arena: std.mem.Allocator, f: Forward, upstream: ?[]const u8, ttl: u32, out: []u8) usize {
+    var r: Response = .{ .flags = .{ .qr = true, .rd = f.rd, .ra = true }, .limit = f.limit, .question = f.question, .opt = f.opt };
+    const m = wire.Message.parse(arena, upstream orelse return r.finish(f.id, out, .servfail).?) catch return r.finish(f.id, out, .servfail).?;
+    var sections: [3][]wire.RR = undefined;
+    for (&sections, [_][]const wire.RR{ m.answer, m.authority, m.additional }) |*dst, src| {
+        var n: usize = 0;
+        dst.* = arena.alloc(wire.RR, src.len) catch return r.finish(f.id, out, .servfail).?;
+        for (src) |rr| if (rr.type != .opt) { // the upstream's OPT is not the client's
+            dst.*[n] = rr;
+            dst.*[n].ttl = ttl;
+            n += 1;
+        };
+        dst.* = dst.*[0..n];
+    }
+    r.upstream = .{ .answer = sections[0], .authority = sections[1], .additional = sections[2] };
+    return r.finish(f.id, out, @enumFromInt(m.flags.rcode)).?;
+}
+
 const Response = struct {
     flags: wire.Flags,
     limit: usize,
@@ -85,6 +123,8 @@ const Response = struct {
     answers: [64]wire.RR = undefined,
     n_answers: usize = 0,
     authority: ?wire.RR = null,
+    /// The sections of a forwarded answer; additional records are dropped when they do not fit.
+    upstream: ?wire.Message = null,
 
     fn answer(r: *Response, rr: wire.RR) void {
         if (r.n_answers == r.answers.len) return; // a 65th record would not fit a UDP answer anyway; TCP gets 64
@@ -114,6 +154,15 @@ const Response = struct {
         if (!r.flags.tc) if (r.authority) |rr| w.rr(.authority, rr) catch {
             r.flags.tc = true;
         };
+        if (r.upstream) |m| {
+            for (m.answer) |rr| if (!r.flags.tc) w.rr(.answer, rr) catch {
+                r.flags.tc = true;
+            };
+            for (m.authority) |rr| if (!r.flags.tc) w.rr(.authority, rr) catch {
+                r.flags.tc = true;
+            };
+            if (!r.flags.tc) for (m.additional) |rr| w.rr(.additional, rr) catch break;
+        }
         std.mem.writeInt(u16, out[2..4], @bitCast(r.flags), .big);
         if (r.opt) |o| {
             w.buf = out[0 .. body.len + reserved];
@@ -201,7 +250,7 @@ const Fixture = struct {
     }
 
     fn reply(f: *Fixture, packet: []const u8, transport: Transport) !wire.Message {
-        const n = respond(f.arena.allocator(), &f.zones, packet, &f.out, transport) orelse return error.NoResponse;
+        const n = respond(f.arena.allocator(), &f.zones, packet, &f.out, transport, null) orelse return error.NoResponse;
         f.last_len = n;
         return wire.Message.parse(f.arena.allocator(), f.out[0..n]);
     }
@@ -338,4 +387,56 @@ test "FORMERR for malformed packets and wrong question counts; no reply to repli
     try expectRcode(try f.reply(f.buf[0..try owned.encode(&f.buf)], .udp), .formerr);
     try testing.expectError(error.NoResponse, f.reply("\x12\x34\x81\x00\x00\x00\x00\x00\x00\x00\x00\x00", .udp));
     try testing.expectError(error.NoResponse, f.reply("\x12\x34\x01", .udp));
+}
+
+test "forwarding: names outside the zones are handed over, answers get RA, the TTL and TC" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    var nbuf: [255]u8 = undefined;
+    const query: wire.Message = .{ .id = 0x1234, .flags = .{ .rd = true }, .question = &.{.{ .name = try wire.nameFromText(&nbuf, "WwW.example.NET."), .type = .txt }}, .additional = &.{(wire.Opt{ .payload = 4096 }).toRR()} };
+    var fwd: ?Forward = null;
+    try testing.expectEqual(@as(?usize, null), respond(a, &f.zones, f.buf[0..try query.encode(&f.buf)], &f.out, .udp, &fwd));
+    const q = fwd.?;
+    try testing.expect(q.rd and q.limit == max_udp_payload and q.opt != null);
+    // A local name is still answered, with forwarding enabled.
+    fwd = null;
+    const local: wire.Message = .{ .id = 1, .question = &.{.{ .name = "\x03hub\x06kekkai\x04uchi\x07example\x03org\x00", .type = .a }} };
+    const n = respond(a, &f.zones, f.buf[0..try local.encode(&f.buf)], &f.out, .udp, &fwd).?;
+    const answered = try wire.Message.parse(a, f.out[0..n]);
+    try testing.expect(fwd == null and answered.flags.aa and answered.flags.ra and answered.answer.len == 1);
+
+    // The upstream answer, lowercase, with its own OPT and a long TXT RRset.
+    var up: [65535]u8 = undefined;
+    const name = "\x03www\x07example\x03net\x00";
+    const txt = "\xff" ++ "x" ** 255;
+    const upstream: wire.Message = .{
+        .id = 0x9999,
+        .flags = .{ .qr = true, .rd = true, .ra = true, .aa = true },
+        .question = &.{.{ .name = name, .type = .txt }},
+        .answer = &(.{wire.RR{ .name = name, .type = .txt, .ttl = 300, .rdata = txt }} ** 8),
+        .additional = &.{(wire.Opt{ .payload = 512 }).toRR()},
+    };
+    const packet = up[0..try upstream.encode(&up)];
+
+    var tcp = q;
+    tcp.limit = f.out.len;
+    const full = try wire.Message.parse(a, f.out[0..forwarded(a, tcp, packet, 42, &f.out)]);
+    try expectForwarded(full, .noerror);
+    try testing.expect(!full.flags.aa and !full.flags.tc);
+    try testing.expectEqualSlices(u8, "\x03WwW\x07example\x03NET\x00", full.question[0].name);
+    try testing.expectEqual(@as(usize, 8), full.answer.len);
+    for (full.answer) |rr| try testing.expectEqual(@as(u32, 42), rr.ttl);
+    try testing.expectEqual(@as(u16, max_udp_payload), (try full.edns()).?.payload);
+
+    const udp = try wire.Message.parse(a, f.out[0..forwarded(a, q, packet, 42, &f.out)]);
+    try testing.expect(udp.flags.tc and udp.answer.len < 8);
+    try expectForwarded(try wire.Message.parse(a, f.out[0..forwarded(a, q, null, 0, &f.out)]), .servfail);
+    try expectForwarded(try wire.Message.parse(a, f.out[0..forwarded(a, q, "junk", 0, &f.out)]), .servfail);
+}
+
+fn expectForwarded(m: wire.Message, rcode: Rcode) !void {
+    try testing.expectEqual(rcode, @as(Rcode, @enumFromInt(m.flags.rcode)));
+    try testing.expectEqual(@as(u16, 0x1234), m.id);
+    try testing.expect(m.flags.qr and m.flags.rd and m.flags.ra and !m.flags.aa);
 }

@@ -53,7 +53,25 @@ in
         "2620:fe::fe"
       ];
       defaultText = lib.literalExpression ''[ "9.9.9.9" "2620:fe::fe" ] in uchi mode, [ ] otherwise'';
-      description = "Upstream resolver addresses, tried in order (ADR 0008). `uchi` mode only.";
+      description = "Upstream resolver addresses, tried in order (ADR 0008). `uchi` mode only; empty = names outside the zones are REFUSED.";
+    };
+
+    forwarding.minTtl = mkOption {
+      type = types.ints.between 0 2147483647;
+      default = 0;
+      description = "Lower clamp of the lifetime of a cached positive answer, in seconds (ADR 0008).";
+    };
+
+    forwarding.maxTtl = mkOption {
+      type = types.ints.between 0 2147483647;
+      default = 86400;
+      description = "Upper clamp of the lifetime of any cached answer, negative ones included, in seconds (ADR 0008).";
+    };
+
+    forwarding.cacheBytes = mkOption {
+      type = types.ints.unsigned;
+      default = 16 * 1024 * 1024;
+      description = "Hard cap on the cache size in bytes; least recently used answers are evicted beyond it (ADR 0008).";
     };
 
     update.keys = mkOption {
@@ -85,6 +103,26 @@ in
         }
       '';
       description = "Zones by origin, in the shape of ADR 0003 without `origin`, which is the attribute name.";
+    };
+
+    reverse.zone = mkOption {
+      type = types.str;
+      example = "uchi.example.org.";
+      description = "The zone of {option}`services.annai.zones` whose `<node>.kekkai` A and AAAA records become the PTRs of the reverse zones; they reuse its SOA, NS, TTL and serial.";
+    };
+
+    reverse.prefixes = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [
+        "10.100.0.0/16"
+        "fd12:3456:789a::/48"
+      ];
+      description = ''
+        kekkai's IPv4 range and IPv6 prefix (ADR 0005): one `in-addr.arpa` or `ip6.arpa` zone each,
+        with `PTR <node>.kekkai.<zone>` for every A or AAAA of such a node name of
+        {option}`services.annai.reverse.zone` inside it. Lengths end on an octet (IPv4) or nibble (IPv6) boundary.
+      '';
     };
 
     configFile = mkOption {

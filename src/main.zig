@@ -21,9 +21,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(usage, .{});
         std.process.exit(2);
     }
-    if (loaded.config.mode == .uchi) std.debug.print("level=warn event=no-forwarder detail=\"queries outside the zones are REFUSED until M2\"\n", .{});
     // shortcut: a GeneralPurposeAllocator in debug builds (ADR 0001) waits for a reason to look for leaks.
-    try server.Server.run(std.heap.page_allocator, loaded.zones, loaded.config.listen);
+    try server.Server.run(std.heap.smp_allocator, loaded.zones, loaded.config.listen, loaded.config.forwarding);
 }
 
 const Loaded = struct { config: config.Config, zones: []const zone.Zone };
@@ -63,4 +62,5 @@ test {
     _ = zone;
     _ = @import("engine.zig");
     _ = server;
+    _ = @import("forward.zig");
 }

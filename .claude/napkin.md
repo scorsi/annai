@@ -5,7 +5,7 @@
 - Zig >= 0.16 has no file API outside `std.Io`: `main(init: std.process.Init)` and `std.Io.Dir.cwd().readFileAlloc(init.io, ...)`. Used only for blocking file reads; the M1 poller stays kqueue/epoll (ADR 0001).
 - `build.zig.zon2json-lock` is written by hand: `zig2nix zon2lock` crashed here (it picked another Zig and wrote a bad tarball into `~/.cache/zig`). Recipe for a new dependency: in a scratch dir, `touch build.zig && zig fetch --global-cache-dir ./gc <url>`, then the lock key is the Zig hash and `hash` is `nix hash path --mode flat gc/p/<zighash>.tar.gz`.
 - A stale `~/.cache/zig/p/<hash>.tar.gz` gives "hash mismatch" in the devShell: delete it.
-- zig2nix uses import-from-derivation: Linux outputs cannot be evaluated on macOS without building on Linux. `nix flake check` on macOS only covers aarch64-darwin.
+- No import-from-derivation allowed: the orchestrator evaluates Linux checks with `--eval-store auto --store ssh-ng://...`, and the local store refuses IFD outputs built remotely ("lacks a signature"). zig2nix's `package` does IFD for `fromZON` (pname/version), `target` (zigTarget) and `deriveLockFile` (zon2nix): flake.nix passes pname, version (regex on build.zig.zon), zigTarget, a non-existent `zigBuildZonLock`, and links its own deps linkFarm (built from the lock with `importJSON`) in `preBuild`. Verify with `nix flake check --all-systems --no-build --option allow-import-from-derivation false`. Recheck after any zig2nix bump.
 
 ## TOML (high)
 - microwave @9b9c69b (ADR 0003). Fails on a value at EOF without trailing newline: `parse` in src/config.zig appends "\n".

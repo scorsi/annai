@@ -61,15 +61,18 @@ pkgs.testers.runNixOSTest {
           assert ";HuB.Kekkai.UCHI.example.org." in out and "10.100.0.1" in out, out
 
       with subtest("AAAA over the IPv6 listener"):
-          assert "fd12:3456:789a::1" in q("+short hub.kekkai.uchi.example.org AAAA", server=v6)
+          out = q("+short hub.kekkai.uchi.example.org AAAA", server=v6)
+          assert "fd12:3456:789a::1" in out, out
 
       with subtest("CNAME chased in zone, over TCP"):
           out = q("+tcp +noall +answer git.uchi.example.org A")
           assert re.search(r"CNAME\s+vm\.kekkai\.uchi\.example\.org\.", out) and "10.100.0.3" in out, out
 
       with subtest("apex SOA and NS in the answer section (hanko locates the zone here)"):
-          assert re.search(r"IN\s+SOA\s+annai\.uchi\.example\.org\. hostmaster\.example\.org\.", q("+noall +answer uchi.example.org SOA"))
-          assert re.search(r"IN\s+NS\s+annai\.uchi\.example\.org\.", q("+noall +answer uchi.example.org NS"))
+          out = q("+noall +answer uchi.example.org SOA")
+          assert re.search(r"IN\s+SOA\s+annai\.uchi\.example\.org\. hostmaster\.example\.org\.", out), out
+          out = q("+noall +answer uchi.example.org NS")
+          assert re.search(r"IN\s+NS\s+annai\.uchi\.example\.org\.", out), out
 
       with subtest("NXDOMAIN, NODATA and empty non-terminal carry the SOA in the authority section"):
           out = q("+noall +comments +authority nope.uchi.example.org A")
@@ -79,15 +82,16 @@ pkgs.testers.runNixOSTest {
               assert "status: NOERROR" in out and "ANSWER: 0" in out and re.search(r"IN\s+SOA", out), out
 
       with subtest("REFUSED outside the loaded zones, NOTIMP for other opcodes"):
-          assert "status: REFUSED" in q("+noall +comments example.net A")
-          assert "status: REFUSED" in q("+noall +comments org A")
-          assert "status: NOTIMP" in q("+noall +comments +opcode=5 hub.kekkai.uchi.example.org A")
+          for args, status in [("example.net A", "REFUSED"), ("org A", "REFUSED"), ("+opcode=5 hub.kekkai.uchi.example.org A", "NOTIMP")]:
+              out = q(f"+noall +comments {args}")
+              assert f"status: {status}" in out, out
 
       with subtest("SRV, MX, TXT, ANY"):
-          assert "10 0 993 mail.soto.example.org." in q("+short _imaps._tcp.uchi.example.org SRV")
-          assert "10 mail.soto.example.org." in q("+short mail.uchi.example.org MX")
-          assert '"v=spf1 -all"' in q("+short info.uchi.example.org TXT")
-          assert re.search(r'HINFO\s+"RFC8482" ""', q("+noall +answer hub.kekkai.uchi.example.org ANY"))
+          for args, expected in [("_imaps._tcp.uchi.example.org SRV", "10 0 993 mail.soto.example.org."), ("mail.uchi.example.org MX", "10 mail.soto.example.org."), ("info.uchi.example.org TXT", '"v=spf1 -all"')]:
+              out = q(f"+short {args}")
+              assert expected in out, out
+          out = q("+noall +answer hub.kekkai.uchi.example.org ANY")
+          assert re.search(r'HINFO\s+"RFC8482" ""', out), out
 
       with subtest("EDNS payload sizing and truncation"):
           out = q("+noedns +ignore +noall +comments +stats big.uchi.example.org TXT")
@@ -99,8 +103,13 @@ pkgs.testers.runNixOSTest {
 
       with subtest("the resolver module: per-link DNS and search domains"):
           client.wait_for_unit("annai-resolver.service")
-          assert "10.100.0.1" in client.succeed("resolvectl query hub.kekkai.uchi.example.org")
-          assert "10.100.0.1" in client.succeed("getent hosts hub")
-          assert "10.100.0.2" in client.succeed("getent hosts annai")
+          out = client.succeed("resolvectl query hub.kekkai.uchi.example.org")
+          assert "10.100.0.1" in out, out
+          # `getent hosts` is gethostbyname2(AF_INET6) first and prints only that family when an
+          # AAAA exists (glibc nss/getent.c), so ask for the A records explicitly. `hub` exists
+          # only under kekkai.<domain>: resolving it at all proves the second search domain.
+          for name, addr in [("hub", "10.100.0.1"), ("annai", "10.100.0.2")]:
+              out = client.succeed(f"getent ahostsv4 {name}")
+              assert addr in out, out
     '';
 }

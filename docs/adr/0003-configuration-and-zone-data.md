@@ -11,6 +11,7 @@ The deployment repository is fully declarative. Every other project of the autho
 
 - **TOML** for both the server configuration and zone data. One main file (`annai.toml`) referencing one TOML file per zone. The NixOS module generates all of them with `pkgs.formats.toml`.
 - **TOML parser = dependency**, chosen at M0 by compatibility with the pinned Zig release (candidates: tomlz, microwave). annai needs only tables, arrays of tables, strings, integers, booleans; datetime support is irrelevant.
+  - **Chosen at M0: [microwave](https://github.com/edqx/microwave) (MIT), pinned by commit in `build.zig.zon` and `build.zig.zon2json-lock`**, against Zig 0.16.0 (ADR-0001). Its own test suite passes on 0.16.0; annai uses only its dynamic `Parser.Value` tree. tomlz is unmaintained since Zig 0.13. microwave tracks Zig 0.15.2, which does not link on current macOS, and its `Populate`/`Stringify` modules do not compile on 0.17.0: the next Zig upgrade waits for microwave or replaces it (contained to `src/config.zig`). Known defect worked around: a value at end of input without a trailing newline fails to parse.
 - **Fully declarative, zero persistent state.** annai never writes to disk. The only in-memory runtime state is the resolver cache (ADR-0008) and ACME TXT records (ADR-0006); both are lost on restart by design.
 - **Zone file shape** (frozen at M0, this is the intent):
 

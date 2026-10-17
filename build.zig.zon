@@ -1,0 +1,13 @@
+.{
+    .name = .annai,
+    .version = "0.0.0",
+    .fingerprint = 0xb3484ce0419c3fb1,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .microwave = .{
+            .url = "https://github.com/edqx/microwave/archive/9b9c69bf3a87f99ce3332d30e5b58230fcf990a6.tar.gz",
+            .hash = "microwave-1.0.0-e4c5GWKsAQC_9-D3SKneI-xQXVVuilU_GcDk-LkvaKFX",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

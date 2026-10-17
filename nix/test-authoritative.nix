@@ -47,7 +47,9 @@ pkgs.testers.runNixOSTest {
           return client.succeed(f"dig @{server} +time=3 +tries=1 +norecurse {args}")
 
       def size(out):
-          return int(re.search(r"MSG SIZE  rcvd: (\d+)", out).group(1))
+          m = re.search(r"MSG SIZE  rcvd: (\d+)", out)
+          assert m, f"no MSG SIZE line in dig output: {out}"
+          return int(m.group(1))
 
       server.wait_for_unit("annai.service")
       server.wait_for_open_port(53)

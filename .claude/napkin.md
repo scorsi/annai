@@ -2,11 +2,13 @@
 
 ## Toolchain (high)
 - Zig 0.16.0 comes from zig2nix (`zig2nix.outputs.packages.<sys>.zig-0_16_0`), pinned in flake.nix. nixpkgs' zig_0_15 and zig2nix's 0.15.2 do not link on current macOS (undefined libc symbols); 0.16.0 does.
-- Zig >= 0.16 has no file API outside `std.Io`: `main(init: std.process.Init)` and `std.Io.Dir.cwd().readFileAlloc(init.io, ...)`. Used only for blocking file reads; the M1 poller stays kqueue/epoll (ADR 0001).
-- `build.zig.zon2json-lock` is written by hand: `zig2nix zon2lock` crashed here (it picked another Zig and wrote a bad tarball into `~/.cache/zig`). Recipe for a new dependency: in a scratch dir, `touch build.zig && zig fetch --global-cache-dir ./gc <url>`, then the lock key is the Zig hash and `hash` is `nix hash path --mode flat gc/p/<zighash>.tar.gz`.
+- Zig 0.16 std: no file API outside `std.Io` (`main(init: std.process.Init)`, `std.Io.Dir.cwd().readFileAlloc(init.io, ...)`), no `std.posix.socket/bind/kevent/write`, no `std.time.milliTimestamp`, no `std.BoundedArray`, no `ArrayList.writer()`. Sockets go through `std.posix.system.*` (libc on macOS, raw syscalls on musl; `posix.errno(rc)` works for both), `posix.setsockopt`/`posix.read`/`posix.poll` still exist, the clock is `system.clock_gettime(CLOCK.MONOTONIC)`. `posix.IPV6` is `void` on darwin: server.zig hardcodes IPV6_V6ONLY = 27 there.
+- Cross-compile locally before pushing: `nix develop -c zig build -Dtarget=x86_64-linux-musl` catches Linux-only std differences (SOCK flags, accept4) in seconds.
+- `build.zig.zon2json-lock` is written by hand: `zig2nix zon2lock` crashed here. Recipe for a new dependency: in a scratch dir, `touch build.zig && zig fetch --global-cache-dir ./gc <url>`, then the lock key is the Zig hash and `hash` is `nix hash path --mode flat gc/p/<zighash>.tar.gz`.
 - A stale `~/.cache/zig/p/<hash>.tar.gz` gives "hash mismatch" in the devShell: delete it.
 - The flake `src` fileset only sees git-tracked files: `git add` a new source or corpus file before `nix flake check`, or the sandbox build fails with `FileNotFound` while the devShell passes.
-- No import-from-derivation allowed: the orchestrator evaluates Linux checks with `--eval-store auto --store ssh-ng://...`, and the local store refuses IFD outputs built remotely ("lacks a signature"). zig2nix's `package` does IFD for `fromZON` (pname/version), `target` (zigTarget) and `deriveLockFile` (zon2nix): flake.nix passes pname, version (regex on build.zig.zon), zigTarget, a non-existent `zigBuildZonLock`, and links its own deps linkFarm (built from the lock with `importJSON`) in `preBuild`. Verify with `nix flake check --all-systems --no-build --option allow-import-from-derivation false`. Recheck after any zig2nix bump.
+- No import-from-derivation allowed: the orchestrator evaluates Linux checks with `--eval-store auto --store ssh-ng://...`. zig2nix's `package` does IFD for `fromZON`, `target` and `deriveLockFile`: flake.nix passes pname, version (regex on build.zig.zon), zigTarget, a non-existent `zigBuildZonLock`, and links its own deps linkFarm in `preBuild`. Verify with `nix flake check --all-systems --no-build --option allow-import-from-derivation false`. Recheck after any zig2nix bump.
+- `nix fmt` (nixfmt-tree) formats in place; run it before `git add`, it rewrites long lines in test scripts.
 
 ## TOML (high)
 - microwave @9b9c69b (ADR 0003). Fails on a value at EOF without trailing newline: `parse` in src/config.zig appends "\n".
@@ -14,16 +16,28 @@
 
 ## Schema choices not spelled out in the ADRs (medium)
 - annai.toml: `mode`, `listen` (`addr:port`, port required), `zones` (paths, relative to annai.toml), `[forwarding] upstreams` (bare IPs, uchi only, optional), `[[update.keys]] name, secret_file` (absolute path, soto only). Unknown keys are errors everywhere.
-- Zones: NS only at the apex (no delegation, ADR 0004); in-zone NS targets need A/AAAA; labels `[a-z0-9_-]`; wildcards and CAA rejected until v1; no per-RRset TTL.
-- Module: `zones.<origin>` attrsets (origin = attribute name); upstreams default Quad9 in uchi mode, rendered whenever non-empty so a soto config with upstreams fails `annai check`.
+- Zones: NS only at the apex (no delegation, ADR 0004); in-zone NS targets need A/AAAA; labels `[a-z0-9_-]`; wildcards and CAA rejected until v1; no per-RRset TTL (the zone `ttl` applies to every RRset including the SOA). TXT values longer than 255 bytes are split into 255-byte character-strings.
+- Module: `zones.<origin>` attrsets (origin = attribute name); upstreams default Quad9 in uchi mode, rendered whenever non-empty so a soto config with upstreams fails `annai check`. No `openFirewall` option: ports are a deployment value (kekkai per-peer firewall, ADR 0010); the nixosTest opens 53 itself.
 
 ## Wire codec (high)
-- src/wire.zig: `Message.parse(arena, packet)` borrows the packet; names and the RDATA of NS/CNAME/SOA/PTR/MX/SRV are decompressed into the arena (`layout`), everything else is opaque (RFC 3597). `Message.encode(buf)` / `Writer` compress owners and the RDATA names of those types except SRV (RFC 3597 §4); a question or RR that does not fit is rolled back (`error.NoSpace`), so M1 truncation is "stop, set TC, send".
-- Pointers must point strictly before themselves (kills loops and forward pointers); label types 0x40/0x80 and names over 255 bytes are `error.Malformed`. A header whose counts cannot fit the packet is refused before any allocation.
-- UPDATE (opcode 5) reuses the four sections; empty RDATA is accepted only in class ANY (RFC 2136 delete forms). TSIG is opaque until M3; `edns()` enforces one root-owned OPT (FORMERR otherwise, to be mapped in M1).
-- Corpora live in `src/corpus/*.txt`, one `name = hex` packet per line, `#` comments, read with `@embedFile` (so they must stay under src/). `captured.txt` = stub queries and public-resolver replies for example.org (round-trip + every prefix and a trailing byte must fail); `malformed.txt` = one hand-made packet per check, all must fail to parse. Add fuzzer findings (M4) there.
+- src/wire.zig: `Message.parse(arena, packet)` borrows the packet; names and the RDATA of NS/CNAME/SOA/PTR/MX/SRV are decompressed into the arena (`layout`), everything else is opaque (RFC 3597). `Message.encode(buf)` / `Writer` compress owners and the RDATA names of those types except SRV (RFC 3597 §4); a question or RR that does not fit is rolled back (`error.NoSpace`).
+- Pointers must point strictly before themselves; label types 0x40/0x80 and names over 255 bytes are `error.Malformed`. A header whose counts cannot fit the packet is refused before any allocation.
+- Corpora live in `src/corpus/*.txt`, one `name = hex` packet per line, read with `@embedFile` (so they must stay under src/). Add fuzzer findings (M4) there.
+
+## Engine and server (high)
+- src/zone.zig: names are lowercase wire names; `Zone.names` holds every owner plus its ancestors as empty `Name`s (ENT = exists, no RRset = NODATA). `zone.find` = longest origin suffix at a label boundary. config.loadZone builds zones (validation and loading are one pass).
+- src/engine.zig `respond(arena, zones, packet, out, transport)`: FORMERR keeps the id and opcode but no question; EDNS errors are FORMERR, version != 0 is BADVERS; UDP limit = clamp(payload, 512, 1232), no OPT = 512, TCP = 65535; the OPT's 11 bytes are reserved so it survives truncation; TC is set when the question, an answer RR or the authority SOA does not fit; additional section is never filled (no glue for MX/SRV/NS targets yet). CNAME chase stops at the zone edge or after 8 hops; the final rcode is the last name's (dangling in-zone target = NXDOMAIN + SOA). ANY = HINFO "RFC8482" if the name exists else NXDOMAIN. Class != IN = REFUSED. RA is always 0 in M1.
+- src/server.zig: one `Server` on the heap (64 KiB buffers), `slots` = 2 per listener + 64 TCP connections (a 65th is closed on accept). TCP: 10 s idle timeout swept once per poll wake (1 s), 100 messages per connection, length-prefixed pipelining; a full socket buffer blocks the loop up to 1 s (`sendAll`, shortcut). UDP: one datagram per readiness event (level-triggered). `[::]` listeners are V6ONLY so `0.0.0.0` and `[::]` both bind.
+- src/poll.zig: epoll (Linux) / kqueue (macOS), read interest only, token = slot index.
+- Local smoke test: write annai.toml + zone in a temp dir, `zig-out/bin/annai serve`, `dig -p 5354 @127.0.0.1 ...` (5353 is mDNS on macOS). zsh: wrap dig in a function, `$D` does not word-split.
+
+## Nix module and tests (medium)
+- systemd unit: `DynamicUser` + `CAP_NET_BIND_SERVICE`, `ExecStart = annai serve <store annai.toml>`, `restartTriggers = [ configFile ]`, strict sandboxing (`SystemCallFilter=@system-service ~@privileged ~@resources`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies=AF_INET AF_INET6`). If the nixosTest shows a seccomp kill, loosen the filter, nothing else.
+- Resolver client: `nixosModules.resolver` (`services.annai.resolver.{enable,address,interface,domain}`) = `systemd-resolved` + a oneshot `annai-resolver.service` bound to the link's `.device` running `resolvectl dns/domain/default-route false`; search domains derived from `domain` (`<domain>`, `kekkai.<domain>`). A link manager that rewrites per-link DNS later wins. `darwinModules.resolver` (`services.annai.resolver.{enable,address,domain}`) = `/etc/resolver/<domain>` + `networking.search` (needs `networking.knownNetworkServices` in the deployment); not evaluated in the flake (nix-darwin is not an input); sanity-check with `lib.evalModules` and stub options.
+- nixosTest `checks.<linux>.authoritative` (nix/test-authoritative.nix): server = example.nix zone + a `big` TXT RRset for truncation, client = dig + the resolver module on eth1. Addresses come from `nodes.<n>.networking.primaryIPAddress`/`primaryIPv6Address` (test framework assigns 192.168.1.N / 2001:db8:1::N). Never run it locally: the orchestrator does.
 
 ## Open
-- M1: engine, `annai` serve command, systemd unit in the module, nixosTest. Codec work left for M1: typed RDATA length checks (A=4, AAAA=16...), case-insensitive name compare, rcode/opcode enums, TC truncation and the OPT payload cap (1232) in the responder.
-- Opaque unknown types (RFC 3597) have no TOML shape yet; TXT strings > 255 bytes: split or reject, decide in M1.
-- Reverse zones generated by the module (M2), resolver client modules (M1).
+- M2: forwarder + cache (`forwarding.upstreams` is parsed and ignored; uchi logs a warning and answers REFUSED outside its zones), reverse zones from the module, resolver module `default-route true` once annai answers everything.
+- M3: soto mode specifics (RD ignored is already the case since nothing recurses), TSIG, UPDATE, CAA; `update.keys` secret files will need `LoadCredential` in the unit.
+- Additional-section glue (A/AAAA of MX/SRV/NS targets) and opaque unknown types (RFC 3597) in TOML have no shape yet.
+- GeneralPurposeAllocator in debug builds (ADR 0001) is not wired: `page_allocator` everywhere.

@@ -98,7 +98,12 @@
         };
       });
 
-      nixosModules.default = import ./nix/module.nix self;
+      nixosModules = {
+        default = import ./nix/module.nix self;
+        # Resolver clients (ADR 0010): point a host at the uchi instance with the search domains.
+        resolver = import ./nix/resolver-nixos.nix;
+      };
+      darwinModules.resolver = import ./nix/resolver-darwin.nix;
 
       # Module evaluation runs on every system: the options of nix/example.nix are evaluated in a
       # NixOS configuration, rendered by nix/render.nix with this system's packages, and checked by
@@ -132,6 +137,10 @@
             services.annai.mode = lib.mkForce "soto";
             services.annai.forwarding.upstreams = [ "192.0.2.53" ];
           });
+        }
+        # The integration test of ADR 0011 (VMs: Linux only).
+        // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
+          authoritative = import ./nix/test-authoritative.nix { inherit self pkgs; };
         }
       );
 

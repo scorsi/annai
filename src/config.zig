@@ -3,6 +3,8 @@
 
 const std = @import("std");
 const mw = @import("microwave");
+const wire = @import("wire.zig");
+const zone = @import("zone.zig");
 
 const Value = mw.Parser.Value;
 const Table = Value.Table;
@@ -25,6 +27,7 @@ pub const Mode = enum { uchi, soto };
 
 pub const Config = struct {
     mode: Mode,
+    listen: []const std.Io.net.IpAddress,
     /// Zone file paths as written; relative ones are relative to annai.toml.
     zones: []const []const u8,
 };
@@ -102,10 +105,12 @@ pub fn checkConfig(a: Allocator, text: []const u8, d: *Diag) Error!Config {
     const mode_name = try string(try need(root, "mode", "annai.toml", d), "mode", d);
     const mode = std.meta.stringToEnum(Mode, mode_name) orelse return d.fail("mode: \"{s}\" is not uchi or soto", .{mode_name});
 
+    var listen: std.ArrayList(std.Io.net.IpAddress) = .empty;
     for (try array(try need(root, "listen", "annai.toml", d), "listen", d)) |v| {
         const s = try string(v, "listen", d);
         const addr = std.Io.net.IpAddress.parseLiteral(s) catch return d.fail("listen: \"{s}\" is not address:port", .{s});
         if (addr.getPort() == 0) return d.fail("listen: \"{s}\" needs a port", .{s});
+        try listen.append(a, addr);
     }
 
     var zones: std.ArrayList([]const u8) = .empty;
@@ -140,31 +145,39 @@ pub fn checkConfig(a: Allocator, text: []const u8, d: *Diag) Error!Config {
             if (!std.fs.path.isAbsolute(path)) return d.fail("update.keys: secret_file \"{s}\" is not absolute", .{path});
         }
     }
-    return .{ .mode = mode, .zones = zones.items };
+    return .{ .mode = mode, .listen = listen.items, .zones = zones.items };
 }
 
 const record_types = .{ "a", "aaaa", "cname", "ns", "ptr", "mx", "srv", "txt" };
 
-/// Validates one zone file and returns its origin.
-pub fn checkZone(a: Allocator, text: []const u8, d: *Diag) Error![]const u8 {
+/// Type codes and the wire RDATA of one record value, built while validating it.
+const Record = struct { type: wire.Type, rdata: []const u8 };
+
+/// Validates one zone file and loads it: RRsets in wire form with the zone's default TTL, the
+/// SOA both as `soa` and as an RRset of the apex, and every empty non-terminal (ADR 0004).
+pub fn loadZone(a: Allocator, text: []const u8, d: *Diag) Error!zone.Zone {
     const root = try parse(a, text, d);
     try checkKeys(root, &.{ "origin", "ttl", "serial", "soa", "names" }, "zone", d);
 
     const origin = try string(try need(root, "origin", "zone", d), "origin", d);
     try checkName(origin, "origin", d);
-    _ = try int(u31, try need(root, "ttl", origin, d), "ttl", d); // RFC 2181: TTLs are 31 bits
-    _ = try int(u32, try need(root, "serial", origin, d), "serial", d);
+    const ttl = try int(u31, try need(root, "ttl", origin, d), "ttl", d); // RFC 2181: TTLs are 31 bits
+    const serial = try int(u32, try need(root, "serial", origin, d), "serial", d);
 
     const soa = try table(try need(root, "soa", origin, d), "soa", d);
     try checkKeys(soa, &.{ "mname", "rname", "refresh", "retry", "expire", "minimum" }, "soa", d);
-    inline for (.{ "mname", "rname" }) |k| _ = try absName(a, try string(try need(soa, k, "soa", d), "soa." ++ k, d), origin, "soa." ++ k, d);
-    inline for (.{ "refresh", "retry", "expire", "minimum" }) |k| _ = try int(u32, try need(soa, k, "soa", d), "soa." ++ k, d);
+    var soa_rdata: std.ArrayList(u8) = .empty;
+    inline for (.{ "mname", "rname" }) |k| try soa_rdata.appendSlice(a, try wireName(a, try absName(a, try string(try need(soa, k, "soa", d), "soa." ++ k, d), origin, "soa." ++ k, d)));
+    try appendInt(a, &soa_rdata, u32, serial);
+    inline for (.{ "refresh", "retry", "expire", "minimum" }) |k| try appendInt(a, &soa_rdata, u32, try int(u32, try need(soa, k, "soa", d), "soa." ++ k, d));
+    const soa_set: zone.RRset = .{ .type = .soa, .ttl = ttl, .rdatas = try a.dupe([]const u8, &.{soa_rdata.items}) };
 
     // Owners by absolute name, for CNAME exclusivity, the apex NS and glue.
     var owners: std.StringArrayHashMapUnmanaged(Table) = .empty;
+    var names: std.StringHashMapUnmanaged(zone.Name) = .empty;
     var ns_targets: std.ArrayList([]const u8) = .empty;
-    const names = try table(try need(root, "names", origin, d), "names", d);
-    for (names.keys(), names.values()) |key, v| {
+    const names_t = try table(try need(root, "names", origin, d), "names", d);
+    for (names_t.keys(), names_t.values()) |key, v| {
         const ctx = try std.fmt.allocPrint(a, "names.\"{s}\"", .{key});
         const owner = try absName(a, key, origin, ctx, d);
         if (!inZone(owner, origin)) return d.fail("{s}: \"{s}\" is outside {s}", .{ ctx, owner, origin });
@@ -174,20 +187,32 @@ pub fn checkZone(a: Allocator, text: []const u8, d: *Diag) Error![]const u8 {
         if (seen.found_existing) return d.fail("{s}: same name as another key ({s})", .{ ctx, owner });
         seen.value_ptr.* = rrsets;
 
+        var sets: std.ArrayList(zone.RRset) = .empty;
+        if (std.mem.eql(u8, owner, origin)) try sets.append(a, soa_set);
         for (rrsets.keys(), rrsets.values()) |rtype, rv| {
             const rctx = try std.fmt.allocPrint(a, "{s}.{s}", .{ ctx, rtype });
             if (std.mem.eql(u8, rtype, "cname")) {
-                _ = try absName(a, try string(rv, rctx, d), origin, rctx, d);
+                const target = try absName(a, try string(rv, rctx, d), origin, rctx, d);
                 if (std.mem.eql(u8, owner, origin)) return d.fail("{s}: no CNAME at the zone apex", .{rctx});
                 if (rrsets.count() > 1) return d.fail("{s}: cname excludes every other type on the name", .{rctx});
+                try sets.append(a, .{ .type = .cname, .ttl = ttl, .rdatas = try a.dupe([]const u8, &.{try wireName(a, target)}) });
                 continue;
             }
-            for (try array(rv, rctx, d)) |r| try checkRecord(a, rtype, r, origin, rctx, d);
+            const values = try array(rv, rctx, d);
+            const rdatas = try a.alloc([]const u8, values.len);
+            var rtype_code: wire.Type = undefined;
+            for (values, rdatas) |r, *rd| {
+                const rec = try checkRecord(a, rtype, r, origin, rctx, d);
+                rtype_code = rec.type;
+                rd.* = rec.rdata;
+            }
+            try sets.append(a, .{ .type = rtype_code, .ttl = ttl, .rdatas = rdatas });
             if (std.mem.eql(u8, rtype, "ns")) {
                 if (!std.mem.eql(u8, owner, origin)) return d.fail("{s}: NS only at the zone apex, no delegation (ADR 0004)", .{rctx});
-                for (rv.anyArrayOrNull().?.items) |r| try ns_targets.append(a, try absName(a, r.string, origin, rctx, d));
+                for (values) |r| try ns_targets.append(a, try absName(a, r.string, origin, rctx, d));
             }
         }
+        try names.put(a, try wireName(a, owner), .{ .rrsets = sets.items });
     }
 
     if (ns_targets.items.len == 0) return d.fail("names.\"@\": the zone apex needs an ns RRset", .{});
@@ -196,31 +221,72 @@ pub fn checkZone(a: Allocator, text: []const u8, d: *Diag) Error![]const u8 {
         const rrsets = owners.get(t) orelse return d.fail("ns: \"{s}\" is in the zone but has no A or AAAA", .{t});
         if (rrsets.get("a") == null and rrsets.get("aaaa") == null) return d.fail("ns: \"{s}\" is in the zone but has no A or AAAA", .{t});
     };
-    return origin;
+
+    // Empty non-terminals: every ancestor of an owner, down to the origin, exists.
+    const origin_wire = try wireName(a, origin);
+    for (owners.keys()) |owner| {
+        var n = try wireName(a, owner);
+        while (n.len > origin_wire.len) {
+            n = n[1 + n[0] ..];
+            const ent = try names.getOrPut(a, n);
+            if (ent.found_existing) break;
+            ent.value_ptr.* = .{};
+        }
+    }
+    return .{ .origin = origin_wire, .soa = soa_set, .names = names };
 }
 
-fn checkRecord(a: Allocator, rtype: []const u8, r: Value, origin: []const u8, ctx: []const u8, d: *Diag) Error!void {
+fn appendInt(a: Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) Allocator.Error!void {
+    var b: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &b, v, .big);
+    try out.appendSlice(a, &b);
+}
+
+fn wireName(a: Allocator, text: []const u8) Error![]const u8 {
+    var buf: [255]u8 = undefined;
+    return a.dupe(u8, wire.nameFromText(&buf, text) catch unreachable); // checkName ran first
+}
+
+fn checkRecord(a: Allocator, rtype: []const u8, r: Value, origin: []const u8, ctx: []const u8, d: *Diag) Error!Record {
     const eql = std.mem.eql;
     if (eql(u8, rtype, "a")) {
         const s = try string(r, ctx, d);
-        _ = std.Io.net.Ip4Address.parse(s, 0) catch return d.fail("{s}: \"{s}\" is not an IPv4 address", .{ ctx, s });
+        const ip = std.Io.net.Ip4Address.parse(s, 0) catch return d.fail("{s}: \"{s}\" is not an IPv4 address", .{ ctx, s });
+        return .{ .type = .a, .rdata = try a.dupe(u8, &ip.bytes) };
     } else if (eql(u8, rtype, "aaaa")) {
         const s = try string(r, ctx, d);
-        _ = std.Io.net.Ip6Address.parse(s, 0) catch return d.fail("{s}: \"{s}\" is not an IPv6 address", .{ ctx, s });
+        const ip = std.Io.net.Ip6Address.parse(s, 0) catch return d.fail("{s}: \"{s}\" is not an IPv6 address", .{ ctx, s });
+        return .{ .type = .aaaa, .rdata = try a.dupe(u8, &ip.bytes) };
     } else if (eql(u8, rtype, "ns") or eql(u8, rtype, "ptr")) {
-        _ = try absName(a, try string(r, ctx, d), origin, ctx, d);
+        const name = try wireName(a, try absName(a, try string(r, ctx, d), origin, ctx, d));
+        return .{ .type = if (eql(u8, rtype, "ns")) .ns else .ptr, .rdata = name };
     } else if (eql(u8, rtype, "txt")) {
-        _ = try string(r, ctx, d);
+        // One <character-string> per 255 bytes, as every zone tool splits long TXT values.
+        const s = try string(r, ctx, d);
+        if (s.len == 0) return d.fail("{s}: empty string", .{ctx});
+        var out: std.ArrayList(u8) = .empty;
+        var rest = s;
+        while (rest.len > 0) {
+            const n = @min(rest.len, 255);
+            try out.append(a, @intCast(n));
+            try out.appendSlice(a, rest[0..n]);
+            rest = rest[n..];
+        }
+        return .{ .type = .txt, .rdata = out.items };
     } else if (eql(u8, rtype, "mx")) {
         const t = try table(r, ctx, d);
         try checkKeys(t, &.{ "preference", "exchange" }, ctx, d);
-        _ = try int(u16, try need(t, "preference", ctx, d), ctx, d);
-        _ = try absName(a, try string(try need(t, "exchange", ctx, d), ctx, d), origin, ctx, d);
+        var out: std.ArrayList(u8) = .empty;
+        try appendInt(a, &out, u16, try int(u16, try need(t, "preference", ctx, d), ctx, d));
+        try out.appendSlice(a, try wireName(a, try absName(a, try string(try need(t, "exchange", ctx, d), ctx, d), origin, ctx, d)));
+        return .{ .type = .mx, .rdata = out.items };
     } else if (eql(u8, rtype, "srv")) {
         const t = try table(r, ctx, d);
         try checkKeys(t, &.{ "priority", "weight", "port", "target" }, ctx, d);
-        inline for (.{ "priority", "weight", "port" }) |k| _ = try int(u16, try need(t, k, ctx, d), ctx, d);
-        _ = try absName(a, try string(try need(t, "target", ctx, d), ctx, d), origin, ctx, d);
+        var out: std.ArrayList(u8) = .empty;
+        inline for (.{ "priority", "weight", "port" }) |k| try appendInt(a, &out, u16, try int(u16, try need(t, k, ctx, d), ctx, d));
+        try out.appendSlice(a, try wireName(a, try absName(a, try string(try need(t, "target", ctx, d), ctx, d), origin, ctx, d)));
+        return .{ .type = .srv, .rdata = out.items };
     } else unreachable; // checkKeys allowed only record_types
 }
 
@@ -264,7 +330,7 @@ fn expectZone(text: []const u8, want: ?[]const u8) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var d: Diag = .{};
-    const got = checkZone(arena.allocator(), text, &d);
+    const got = loadZone(arena.allocator(), text, &d);
     if (want) |msg| {
         try testing.expectError(error.Invalid, got);
         if (std.mem.indexOf(u8, d.msg, msg) == null) {
@@ -272,7 +338,7 @@ fn expectZone(text: []const u8, want: ?[]const u8) !void {
             return error.TestUnexpectedResult;
         }
     } else {
-        try testing.expectEqualStrings("uchi.example.org.", try got);
+        try testing.expectEqualStrings("\x04uchi\x07example\x03org\x00", (try got).origin);
     }
 }
 

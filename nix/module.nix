@@ -1,5 +1,5 @@
-# NixOS module skeleton for annai (ADR 0010): options rendered to TOML and checked at build time by
-# nix/render.nix. The service unit comes with the server itself (M1).
+# NixOS module for annai (ADR 0010): options rendered to TOML and checked at build time by
+# nix/render.nix, and the hardened service unit (ADR 0011).
 self:
 {
   config,
@@ -101,5 +101,51 @@ in
 
   config = lib.mkIf cfg.enable {
     environment.etc."annai/annai.toml".source = cfg.configFile;
+
+    systemd.services.annai = {
+      description = "annai DNS server (${cfg.mode} mode)";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" ];
+      # ADR 0011 v0: a configuration change restarts the service (reload is M5).
+      restartTriggers = [ cfg.configFile ];
+      serviceConfig = {
+        ExecStart = "${lib.getExe cfg.package} serve ${cfg.configFile}";
+        Restart = "on-failure";
+        RestartSec = "2s";
+        # annai never writes to disk (ADR 0003) and only needs to bind port 53.
+        DynamicUser = true;
+        AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+        CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        RestrictAddressFamilies = [
+          "AF_INET"
+          "AF_INET6"
+        ];
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        SystemCallArchitectures = "native";
+        SystemCallFilter = [
+          "@system-service"
+          "~@privileged"
+          "~@resources"
+        ];
+        UMask = "0077";
+      };
+    };
   };
 }

@@ -47,4 +47,5 @@ fn report(e: config.Error, path: []const u8, d: *const config.Diag) error{ Repor
 
 test {
     _ = config;
+    _ = @import("wire.zig");
 }

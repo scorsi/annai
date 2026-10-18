@@ -291,6 +291,9 @@ pub const apex_zone =
     \\[names."@"]
     \\ns = ["ns1"]
     \\caa = [{ flags = 0, tag = "issue", value = "letsencrypt.org" }]
+    \\mx = [{ preference = 0, exchange = "." }]
+    \\[names."_imaps._tcp"]
+    \\srv = [{ priority = 0, weight = 0, port = 0, target = "." }]
     \\[names."ns1"]
     \\a = ["192.0.2.53"]
     \\[names."*"]
@@ -485,6 +488,20 @@ test "REFUSED outside the zones, NOTIMP for other opcodes, ANY is HINFO" {
     try testing.expectEqual(wire.Type.hinfo, any.answer[0].type);
     try testing.expectEqualSlices(u8, hinfo_rfc8482, any.answer[0].rdata);
     try expectRcode(try f.ask(.{ .name = "nope.uchi.example.org.", .type = .any }), .nxdomain);
+}
+
+test "null MX (RFC 7505) and SRV target \".\" (RFC 2782): the root is served as one zero byte" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const mx = try f.ask(.{ .name = "example.org.", .type = .mx });
+    try expectRcode(mx, .noerror);
+    try testing.expectEqual(@as(usize, 1), mx.answer.len);
+    try testing.expectEqualSlices(u8, "\x00\x00\x00", mx.answer[0].rdata);
+    try testing.expectEqual(@as(usize, 0), mx.additional.len); // nothing chased for "."
+    try testing.expectEqualSlices(u8, "\x00\x0f\x00\x01\x00\x00\x01\x2c\x00\x03\x00\x00\x00", f.out[f.last_len - 13 .. f.last_len]);
+    const srv = try f.ask(.{ .name = "_imaps._tcp.example.org.", .type = .srv });
+    try expectRcode(srv, .noerror);
+    try testing.expectEqualSlices(u8, "\x00" ** 7, srv.answer[0].rdata);
 }
 
 test "EDNS: payload clamped to [512, 1232] over UDP, OPT echoed, BADVERS, TC when too big" {

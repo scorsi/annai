@@ -480,6 +480,26 @@ test "SRV targets are never compressed" {
     try expectEqualMessages(m, try Message.parse(arena.allocator(), buf[0..len]));
 }
 
+test "the root as null MX exchange (RFC 7505) and SRV target (RFC 2782) is one zero byte" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const owner = wn("example.org.");
+    const m: Message = .{
+        .question = &.{.{ .name = owner, .type = .mx }},
+        .answer = &.{
+            .{ .name = owner, .type = .mx, .rdata = "\x00\x00\x00" },
+            .{ .name = owner, .type = .srv, .rdata = "\x00\x00\x00\x00\x00\x00\x00" },
+        },
+    };
+    var buf: [512]u8 = undefined;
+    const len = try m.encode(&buf);
+    // Each RR: owner pointer, type, class, ttl, rdlength 3 (resp. 7), then the RDATA verbatim.
+    const rr0 = 12 + owner.len + 4;
+    try testing.expectEqualSlices(u8, "\xc0\x0c\x00\x0f\x00\x01\x00\x00\x00\x00\x00\x03\x00\x00\x00", buf[rr0..][0..15]);
+    try testing.expectEqualSlices(u8, "\xc0\x0c\x00\x21\x00\x01\x00\x00\x00\x00\x00\x07" ++ "\x00" ** 7, buf[rr0 + 15 .. len]);
+    try expectEqualMessages(m, try Message.parse(arena.allocator(), buf[0..len]));
+}
+
 test "a chain of backward pointers and a pointer into RDATA are valid" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

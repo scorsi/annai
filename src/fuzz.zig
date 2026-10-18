@@ -77,6 +77,8 @@ pub const Fixture = struct {
             .{ "\x03big\x04uchi\x07example\x03org\x00", .txt },
             .{ "\x0f_acme-challenge\x03git\x04uchi\x07example\x03org\x00", .txt },
             .{ "\x07example\x03org\x00", .caa },
+            .{ "\x07example\x03org\x00", .mx },
+            .{ "\x06_imaps\x04_tcp\x07example\x03org\x00", .srv },
             .{ "\x03hub\x06kekkai\x04uchi\x07example\x03org\x00", .any },
             .{ "\x03www\x07example\x03net\x00", .aaaa },
         }) |q| try f.seed(.{ .id = 0x1234, .flags = .{ .rd = true }, .question = &.{.{ .name = q[0], .type = q[1] }}, .additional = &.{opt} });

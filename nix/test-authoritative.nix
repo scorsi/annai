@@ -22,6 +22,13 @@ pkgs.testers.runNixOSTest {
           "host.wild".a = [ "10.100.0.10" ];
           "x.ent.wild".a = [ "10.100.0.11" ];
           "*.alias".cname = "vm.kekkai";
+          # Null MX (RFC 7505): the root as the exchange.
+          nomail.mx = [
+            {
+              preference = 0;
+              exchange = ".";
+            }
+          ];
         };
         # No forwarding (no Internet in the sandbox): names outside the zones stay REFUSED.
         services.annai.forwarding.upstreams = [ ];
@@ -101,6 +108,8 @@ pkgs.testers.runNixOSTest {
           for args, expected in [("_imaps._tcp.uchi.example.org SRV", "10 0 993 mail.soto.example.org."), ("mail.uchi.example.org MX", "10 mail.soto.example.org."), ("info.uchi.example.org TXT", '"v=spf1 -all"')]:
               out = q(f"+short {args}")
               assert expected in out, out
+          out = q("+noall +answer nomail.uchi.example.org MX")
+          assert re.search(r"^nomail\.uchi\.example\.org\.\s+300\s+IN\s+MX\s+0 \.$", out, re.M), out
           out = q("+noall +answer hub.kekkai.uchi.example.org ANY")
           assert re.search(r'HINFO\s+"RFC8482" ""', out), out
 

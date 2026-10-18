@@ -254,6 +254,8 @@ pub fn loadZone(a: Allocator, text: []const u8, d: *Diag) Error!zone.Zone {
                 rtype_code = rec.type;
                 rd.* = rec.rdata;
             }
+            if (rtype_code == .mx and rdatas.len > 1) for (rdatas) |rd| if (rd.len == 3)
+                return d.fail("{s}: a null MX (exchange \".\") must be the only MX of its name (RFC 7505)", .{rctx});
             try sets.append(a, .{ .type = rtype_code, .ttl = ttl, .rdatas = rdatas });
             if (std.mem.eql(u8, rtype, "ns")) {
                 if (!std.mem.eql(u8, owner, origin)) return d.fail("{s}: NS only at the zone apex, no delegation (ADR 0004)", .{rctx});
@@ -295,6 +297,13 @@ fn wireName(a: Allocator, text: []const u8) Error![]const u8 {
     return a.dupe(u8, wire.nameFromText(&buf, text) catch unreachable); // checkName ran first
 }
 
+/// An MX exchange or SRV target in wire form: a name as `absName` takes it, or the root "." (null
+/// MX, RFC 7505; service decidedly not available, RFC 2782), allowed nowhere else.
+fn targetName(a: Allocator, v: Value, origin: []const u8, ctx: []const u8, d: *Diag) Error![]const u8 {
+    const s = try string(v, ctx, d);
+    return wireName(a, if (std.mem.eql(u8, s, ".")) s else try absName(a, s, origin, ctx, d));
+}
+
 fn checkRecord(a: Allocator, rtype: []const u8, r: Value, origin: []const u8, ctx: []const u8, d: *Diag) Error!Record {
     const eql = std.mem.eql;
     if (eql(u8, rtype, "a")) {
@@ -325,15 +334,18 @@ fn checkRecord(a: Allocator, rtype: []const u8, r: Value, origin: []const u8, ct
         const t = try table(r, ctx, d);
         try checkKeys(t, &.{ "preference", "exchange" }, ctx, d);
         var out: std.ArrayList(u8) = .empty;
-        try appendInt(a, &out, u16, try int(u16, try need(t, "preference", ctx, d), ctx, d));
-        try out.appendSlice(a, try wireName(a, try absName(a, try string(try need(t, "exchange", ctx, d), ctx, d), origin, ctx, d)));
+        const pref = try int(u16, try need(t, "preference", ctx, d), ctx, d);
+        const exchange = try targetName(a, try need(t, "exchange", ctx, d), origin, ctx, d);
+        if (exchange.len == 1 and pref != 0) return d.fail("{s}: a null MX (exchange \".\") has preference 0, not {d} (RFC 7505)", .{ ctx, pref });
+        try appendInt(a, &out, u16, pref);
+        try out.appendSlice(a, exchange);
         return .{ .type = .mx, .rdata = out.items };
     } else if (eql(u8, rtype, "srv")) {
         const t = try table(r, ctx, d);
         try checkKeys(t, &.{ "priority", "weight", "port", "target" }, ctx, d);
         var out: std.ArrayList(u8) = .empty;
         inline for (.{ "priority", "weight", "port" }) |k| try appendInt(a, &out, u16, try int(u16, try need(t, k, ctx, d), ctx, d));
-        try out.appendSlice(a, try wireName(a, try absName(a, try string(try need(t, "target", ctx, d), ctx, d), origin, ctx, d)));
+        try out.appendSlice(a, try targetName(a, try need(t, "target", ctx, d), origin, ctx, d));
         return .{ .type = .srv, .rdata = out.items };
     } else if (eql(u8, rtype, "caa")) {
         // RFC 8659: flags, a tag of 1-15 letters or digits, a value of any length.
@@ -387,6 +399,12 @@ const good_zone =
     \\[names."_imaps._tcp"]
     \\srv = [{ priority = 10, weight = 0, port = 993, target = "mail.soto.example.org." }]
     \\
+    \\[names."nomail"]
+    \\mx = [{ preference = 0, exchange = "." }]
+    \\
+    \\[names."_off._tcp"]
+    \\srv = [{ priority = 0, weight = 0, port = 0, target = "." }]
+    \\
     \\[names."web"]
     \\caa = [{ flags = 0, tag = "issue", value = "letsencrypt.org" }]
     \\
@@ -422,6 +440,17 @@ fn mutate(old: []const u8, new: []const u8) ![]u8 {
 
 test "the ADR 0003 zone is valid" {
     try expectZone(good_zone, null);
+}
+
+test "the root is one zero byte as a null MX exchange and an SRV target" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diag = .{};
+    const z = try loadZone(arena.allocator(), good_zone, &d);
+    const nomail = z.names.get("\x06nomail\x04uchi\x07example\x03org\x00").?;
+    try testing.expectEqualSlices(u8, "\x00\x00\x00", nomail.rrsets[0].rdatas[0]);
+    const off = z.names.get("\x04_off\x04_tcp\x04uchi\x07example\x03org\x00").?;
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x00\x00\x00", off.rrsets[0].rdatas[0]);
 }
 
 test "every invalid zone is rejected" {
@@ -461,6 +490,14 @@ test "every invalid zone is rejected" {
         .{ "preference = 10", "preference = 10, weight = 1", "unknown key \"weight\"" },
         .{ "exchange = \"mail.soto.example.org.\"", "exchange = \"mail soto\"", "character ' '" },
         .{ "origin = \"uchi.example.org.\"", "origin = = 1", "invalid TOML" },
+        // The root "." only as an MX exchange (null MX, RFC 7505: preference 0, alone) or SRV target.
+        .{ "preference = 0, exchange = \".\"", "preference = 10, exchange = \".\"", "has preference 0, not 10" },
+        .{ "preference = 0, exchange = \".\" }", "preference = 0, exchange = \".\" }, { preference = 10, exchange = \"mail\" }", "must be the only MX" },
+        .{ "cname = \"web\"", "cname = \".\"", "\".\" is not an absolute name" },
+        .{ "ns = [\"annai.uchi.example.org.\"]", "ns = [\".\"]", "\".\" is not an absolute name" },
+        .{ "mname = \"annai.uchi.example.org.\"", "mname = \".\"", "\".\" is not an absolute name" },
+        .{ "[names.\"git\"]", "[names.\".\"]", "\".\" is not an absolute name" },
+        .{ "origin = \"uchi.example.org.\"", "origin = \".\"", "\".\" is not an absolute name" },
         // Wildcards: `*` is a whole leftmost owner label, nothing else (RFC 4592, ADR 0007).
         .{ "[names.\"*.wild\"]", "[names.\"a.*.wild\"]", "character '*'" },
         .{ "[names.\"*.wild\"]", "[names.\"*.*.wild\"]", "character '*'" },

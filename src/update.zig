@@ -179,7 +179,7 @@ fn isChallenge(owner: []const u8) bool {
 fn validTxt(rdata: []const u8) bool {
     if (rdata.len == 0) return false;
     var i: usize = 0;
-    while (i < rdata.len) i += 1 + rdata[i];
+    while (i < rdata.len) i += 1 + @as(usize, rdata[i]); // a u8 sum traps on a 0xff length (fuzzer finding)
     return i == rdata.len;
 }
 

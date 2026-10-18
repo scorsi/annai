@@ -1,0 +1,10 @@
+# Fuzzer findings (src/fuzz.zig, M4): one packet per line, `name = hex`, a `#` starts a comment.
+# `zig build test` replays every line through every target (codec, respond, update); a line
+# documents the finding it reproduces and the fix.
+# Writer.sameName read past the written length: with the output buffer reused between messages,
+# a label matched itself plus the previous message's bytes and became a pointer to itself
+# (fixed: only written bytes count). The reply to this CNAME re-encoded into a looping name.
+self-pointer-compression = 000081800001000100000000076578616d706c65036f62670000010001c00c0005000100000e100002c005
+# update.validTxt summed `1 + rdata[i]` in u8: a TXT character-string length of 0xff trapped on
+# integer overflow, crashing a soto on a signed UPDATE (fixed: usize arithmetic).
+txt-length-ff-overflow = 6cb328000001000000010001076578616d706c65036f726700000600010f5f61636d652d6368616c6c656e6765036769740475636869c00c001000010000003c0005ff746f6b310568616e6b6e0000fa00ff00000000003d0b686d61632d73686132000e100002c02973fd01c70020dcebc399984f10a0666800f4a943f883faa152c3d028321381c7349dba7576046cb300000000

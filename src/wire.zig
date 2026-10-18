@@ -337,14 +337,17 @@ pub const Writer = struct {
     }
 
     /// Compares the (possibly compressed) name at `off` in the output with an uncompressed one.
-    /// The output is ours, so its pointers are trusted to go backwards.
+    /// The output is ours, so its pointers are trusted to go backwards. Only bytes written so far
+    /// count: past `len` lies the previous message, and the name being written is itself a
+    /// candidate for its own later labels (fuzzer finding, src/corpus/fuzz.txt).
     fn sameName(w: *const Writer, off: u16, n: []const u8) bool {
         var o: usize = off;
         var i: usize = 0;
         while (true) {
+            if (o >= w.len) return false;
             while (w.buf[o] & 0xC0 == 0xC0) o = @as(usize, w.buf[o] & 0x3F) << 8 | w.buf[o + 1];
             const c = w.buf[o];
-            if (c != n[i]) return false;
+            if (o + 1 + c > w.len or c != n[i]) return false;
             if (c == 0) return true;
             if (!std.mem.eql(u8, w.buf[o + 1 ..][0..c], n[i + 1 ..][0..c])) return false;
             o += 1 + c;
@@ -390,15 +393,15 @@ fn expectEqualMessages(want: Message, got: Message) !void {
 }
 
 /// Iterates a corpus file: `name = hex` lines, `#` comments.
-const Corpus = struct {
+pub const Corpus = struct {
     lines: std.mem.SplitIterator(u8, .scalar),
     buf: [4096]u8 = undefined,
 
-    fn init(text: []const u8) Corpus {
+    pub fn init(text: []const u8) Corpus {
         return .{ .lines = std.mem.splitScalar(u8, text, '\n') };
     }
 
-    fn next(c: *Corpus) ?struct { name: []const u8, packet: []const u8 } {
+    pub fn next(c: *Corpus) ?struct { name: []const u8, packet: []const u8 } {
         while (c.lines.next()) |line| {
             if (line.len == 0 or line[0] == '#') continue;
             const eq = std.mem.indexOf(u8, line, " = ") orelse @panic("corpus line without ' = '");
@@ -524,6 +527,19 @@ test "two OPT RRs or an OPT with an owner are FORMERR" {
 test "a lying header is refused before any allocation" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(error.Malformed, Message.parse(failing.allocator(), "\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00"));
+}
+
+test "a reused buffer lends no bytes to compression" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // After `www.example.org`, the output holds "example.org" right where the second label of
+    // `www.www.example.org` goes: the first label must not be taken as a match for the rest.
+    var buf: [512]u8 = undefined;
+    const first: Message = .{ .question = &.{.{ .name = wn("www.example.org."), .type = .a }} };
+    _ = try first.encode(&buf);
+    const second: Message = .{ .question = &.{.{ .name = wn("www.www.example.org."), .type = .a }}, .answer = &.{.{ .name = wn("www.www.example.org."), .type = .cname, .rdata = wn("www.www.example.org.") }} };
+    const len = try second.encode(&buf);
+    try expectEqualMessages(second, try Message.parse(arena.allocator(), buf[0..len]));
 }
 
 test "no space leaves the counts untouched" {

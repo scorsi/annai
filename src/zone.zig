@@ -48,7 +48,7 @@ pub fn isUnder(name: []const u8, origin: []const u8) bool {
     if (name.len < origin.len) return false;
     const at = name.len - origin.len;
     var i: usize = 0;
-    while (i < at) i += 1 + name[i]; // label starts are the only valid suffix offsets
+    while (i < at) i += 1 + @as(usize, name[i]); // label starts are the only valid suffix offsets
     return i == at and std.mem.eql(u8, name[at..], origin);
 }
 
@@ -69,7 +69,7 @@ pub const Formatter = struct {
     pub fn format(f: Formatter, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (f.name.len <= 1) return w.writeAll(".");
         var i: usize = 0;
-        while (i < f.name.len and f.name[i] != 0) : (i += 1 + f.name[i]) {
+        while (i < f.name.len and f.name[i] != 0) : (i += 1 + @as(usize, f.name[i])) {
             for (f.name[i + 1 ..][0..@min(f.name[i], f.name.len - i - 1)]) |c| try w.writeByte(if (std.ascii.isPrint(c) and c != ' ') c else '?');
             try w.writeByte('.');
         }

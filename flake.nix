@@ -153,6 +153,29 @@
         default = (envFor system).mkShell { };
       });
 
+      # `nix run .#fuzz -- <codec|respond|update> <seconds> [seed]` from the repository root
+      # (ADR 0011): the seeded mutator of src/fuzz.zig in ReleaseSafe, so safety checks stay on.
+      # Findings print as `fuzz: ...` lines; add each to src/corpus/fuzz.txt, which the tests replay.
+      apps = forAllSystems (system: {
+        fuzz = {
+          type = "app";
+          program = lib.getExe (
+            (pkgsFor system).writeShellApplication {
+              name = "annai-fuzz";
+              runtimeInputs = [ zig2nix.outputs.packages.${system}.zig-0_16_0 ];
+              text = ''
+                if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+                  echo "usage: nix run .#fuzz -- <codec|respond|update> <seconds> [seed]" >&2
+                  exit 2
+                fi
+                exec zig build fuzz -Doptimize=ReleaseSafe -- "$@"
+              '';
+            }
+          );
+          meta.description = "Fuzz annai's codec, responder or UPDATE path for a number of seconds";
+        };
+      });
+
       formatter = forAllSystems (system: (pkgsFor system).nixfmt-tree);
     };
 }

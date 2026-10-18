@@ -100,6 +100,7 @@ test {
     _ = @import("forward.zig");
     _ = tsig;
     _ = @import("update.zig");
+    _ = @import("fuzz.zig");
 }
 
 test "key files: bare base64 or hanko's name:base64, same key only" {

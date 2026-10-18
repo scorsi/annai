@@ -11,7 +11,7 @@ annai (案内) is a from-scratch DNS server for the author's homelab. It owns ev
 
 - **Zig**, pinned to a tagged release in the flake (track the release branch of every dependency, never Zig master).
 - **No shared code** with kekkai, genkan or hanko. All integration goes through wire protocols (DNS, RFC 2136). See ADR-0010.
-- **Single-threaded event loop** over non-blocking sockets: kqueue on macOS, epoll on Linux, behind a small internal poller abstraction. No dependency on Zig async / `std.Io` until it is stable.
+- **Single-threaded event loop** over non-blocking sockets: kqueue on macOS, epoll on Linux, behind a small internal poller abstraction. The event loop is annai's own poller (`src/poll.zig`); `std.Io` is used only for blocking file reads.
 - **Memory**: one arena per request; long-lived data (zones, cache) in dedicated allocators. `std.heap.GeneralPurposeAllocator` in debug builds to catch leaks.
 - **Build & packaging**: `zig build`; Nix packaging through zig2nix with dependency hashes fixed in the flake. The binary is static on Linux (musl target) so the public entry points carry no runtime dependencies.
 

@@ -46,7 +46,10 @@ pkgs.testers.runNixOSTest {
 
       def nsupdate(script, key=key, opts=""):
           """nsupdate's own output; the exit status is not the oracle, the printed rcode is."""
-          lines = f"server {v4}\nzone example.org\n{script}\nsend\n"
+          # check-names off: nsupdate would otherwise refuse an A record under `_acme-challenge`
+          # locally (bind 9.20 nsupdate.c, dns_rdata_checkowner) and annai's policy would never be
+          # exercised; hanko (miekg/dns) sends such a record as is.
+          lines = f"server {v4}\nzone example.org\ncheck-names off\n{script}\nsend\n"
           key_opt = f"-y {key}" if key else ""
           _, out = client.execute(f"printf '{lines}' | nsupdate {key_opt} {opts} 2>&1")
           return out

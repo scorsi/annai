@@ -105,21 +105,21 @@
       };
       darwinModules.resolver = import ./nix/resolver-darwin.nix;
 
-      # Module evaluation runs on every system: the options of nix/example.nix are evaluated in a
-      # NixOS configuration, rendered by nix/render.nix with this system's packages, and checked by
-      # `annai check`; a configuration that does not match its mode must fail that build.
+      # Module evaluation runs on every system: the options of an example module are evaluated in
+      # a NixOS configuration, rendered by nix/render.nix with this system's packages, and checked
+      # by `annai check`; a configuration that does not match its mode must fail that build.
       checks = forAllSystems (
         system:
         let
           pkgs = pkgsFor system;
           render =
-            extra:
+            example: extra:
             let
               cfg =
                 (lib.nixosSystem {
                   modules = [
                     self.nixosModules.default
-                    ./nix/example.nix
+                    example
                     extra
                     { nixpkgs.hostPlatform = lib.replaceStrings [ "darwin" ] [ "linux" ] system; }
                   ];
@@ -132,16 +132,20 @@
         in
         {
           default = self.packages.${system}.default;
-          module = render { };
-          module-mode-mismatch = pkgs.testers.testBuildFailure (render {
-            services.annai.mode = lib.mkForce "soto";
-            services.annai.forwarding.upstreams = [ "192.0.2.53" ];
-          });
+          module = render ./nix/example.nix { };
+          module-soto = render ./nix/example-soto.nix { };
+          module-mode-mismatch = pkgs.testers.testBuildFailure (
+            render ./nix/example.nix {
+              services.annai.mode = lib.mkForce "soto";
+              services.annai.forwarding.upstreams = [ "192.0.2.53" ];
+            }
+          );
         }
-        # The integration test of ADR 0011 (VMs: Linux only).
+        # The integration tests of ADR 0011 (VMs: Linux only).
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
           authoritative = import ./nix/test-authoritative.nix { inherit self pkgs; };
           forwarding = import ./nix/test-forwarding.nix { inherit self pkgs; };
+          update = import ./nix/test-update.nix { inherit self pkgs; };
         }
       );
 

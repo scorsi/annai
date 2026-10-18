@@ -2,6 +2,8 @@ const std = @import("std");
 const config = @import("config.zig");
 const zone = @import("zone.zig");
 const server = @import("server.zig");
+const tsig = @import("tsig.zig");
+const wire = @import("wire.zig");
 
 const usage = "usage: annai check <annai.toml> | annai serve <annai.toml>\n";
 
@@ -21,8 +23,41 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(usage, .{});
         std.process.exit(2);
     }
+    // Secrets are read only to serve: at build time `annai check` sees the paths, not the files.
+    const keys = if (loaded.config.update) |u| loadKeys(init.io, init.arena.allocator(), u.keys) catch |e| switch (e) {
+        error.Reported => std.process.exit(1),
+        else => return e,
+    } else &.{};
     // shortcut: a GeneralPurposeAllocator in debug builds (ADR 0001) waits for a reason to look for leaks.
-    try server.Server.run(std.heap.smp_allocator, loaded.zones, loaded.config.listen, loaded.config.forwarding);
+    try server.Server.run(std.heap.smp_allocator, loaded.zones, loaded.config, keys);
+}
+
+/// Reads the TSIG secrets (ADR 0006). A key file holds one line: the base64 secret, optionally
+/// prefixed with `<name>:` as in hanko's key files, so one sops secret can feed both products.
+fn loadKeys(io: std.Io, a: std.mem.Allocator, refs: []const config.KeyRef) ![]tsig.Key {
+    const keys = try a.alloc(tsig.Key, refs.len);
+    for (refs, keys) |ref, *k| {
+        k.* = .{ .name = ref.name, .secret = parseKey(a, ref.name, try read(io, a, ref.secret_file)) catch {
+            std.debug.print("annai: {s}: expected one line, `<base64 secret>` or `{f}:<base64 secret>`\n", .{ ref.secret_file, zone.fmt(ref.name) });
+            return error.Reported;
+        } };
+    }
+    return keys;
+}
+
+fn parseKey(a: std.mem.Allocator, name: []const u8, text: []const u8) ![]const u8 {
+    const line = std.mem.trim(u8, text, " \t\r\n");
+    const b64 = if (std.mem.lastIndexOfScalar(u8, line, ':')) |i| blk: {
+        var buf: [255]u8 = undefined;
+        const n = try wire.nameFromText(&buf, line[0..i]);
+        if (!std.mem.eql(u8, zone.lower(buf[0..n.len]), name)) return error.OtherKey;
+        break :blk line[i + 1 ..];
+    } else line;
+    const decoder = std.base64.standard.Decoder;
+    const secret = try a.alloc(u8, try decoder.calcSizeForSlice(b64));
+    try decoder.decode(secret, b64);
+    if (secret.len == 0) return error.Empty;
+    return secret;
 }
 
 const Loaded = struct { config: config.Config, zones: []const zone.Zone };
@@ -58,9 +93,23 @@ fn report(e: config.Error, path: []const u8, d: *const config.Diag) error{ Repor
 
 test {
     _ = config;
-    _ = @import("wire.zig");
+    _ = wire;
     _ = zone;
     _ = @import("engine.zig");
     _ = server;
     _ = @import("forward.zig");
+    _ = tsig;
+    _ = @import("update.zig");
+}
+
+test "key files: bare base64 or hanko's name:base64, same key only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("secret", try parseKey(a, "\x05hanko\x00", "c2VjcmV0\n"));
+    try std.testing.expectEqualStrings("secret", try parseKey(a, "\x05hanko\x00", "Hanko.:c2VjcmV0"));
+    try std.testing.expectEqualStrings("secret", try parseKey(a, "\x05hanko\x07example\x03org\x00", "hanko.example.org:c2VjcmV0"));
+    try std.testing.expectError(error.OtherKey, parseKey(a, "\x05hanko\x00", "other:c2VjcmV0"));
+    try std.testing.expectError(error.Empty, parseKey(a, "\x05hanko\x00", ""));
+    try std.testing.expectError(error.InvalidCharacter, parseKey(a, "\x05hanko\x00", "!!!!"));
 }

@@ -32,6 +32,22 @@ pub const Config = struct {
     zones: []const []const u8,
     /// uchi only; absent means names outside the zones are REFUSED.
     forwarding: ?Forwarding = null,
+    /// soto only (ADR 0006).
+    update: ?Update = null,
+};
+
+/// `[update]` (ADR 0006).
+pub const Update = struct {
+    keys: []const KeyRef,
+    /// Cap on the TTL of a dynamic record, and the seconds it stays whatever its TTL.
+    max_ttl: u32 = 120,
+    lifetime: u32 = 3600,
+};
+
+pub const KeyRef = struct {
+    /// Lowercase wire name.
+    name: []const u8,
+    secret_file: []const u8,
 };
 
 /// `[forwarding]` (ADR 0008).
@@ -151,26 +167,33 @@ pub fn checkConfig(a: Allocator, text: []const u8, d: *Diag) Error!Config {
         if (f.min_ttl > f.max_ttl) return d.fail("forwarding: min_ttl {d} is above max_ttl {d}", .{ f.min_ttl, f.max_ttl });
         forwarding = f;
     }
+    var update: ?Update = null;
     if (root.get("update")) |v| {
         if (mode != .soto) return d.fail("update: only allowed in soto mode", .{});
         const t = try table(v, "update", d);
-        try checkKeys(t, &.{"keys"}, "update", d);
+        try checkKeys(t, &.{ "keys", "max_ttl", "lifetime" }, "update", d);
         const keys = try array(try need(t, "keys", "update", d), "update.keys", d);
-        for (keys, 0..) |k, i| {
+        const refs = try a.alloc(KeyRef, keys.len);
+        for (keys, refs, 0..) |k, *ref, i| {
             const kt = try table(k, "update.keys", d);
             try checkKeys(kt, &.{ "name", "secret_file" }, "update.keys", d);
             const name = try string(try need(kt, "name", "update.keys", d), "update.keys.name", d);
-            try checkName(if (std.mem.endsWith(u8, name, ".")) name else try std.fmt.allocPrint(a, "{s}.", .{name}), "update.keys.name", d);
-            for (keys[0..i]) |prev| if (std.mem.eql(u8, prev.anyTableOrNull().?.get("name").?.string, name))
-                return d.fail("update.keys: duplicate key \"{s}\"", .{name});
+            const abs = if (std.mem.endsWith(u8, name, ".")) name else try std.fmt.allocPrint(a, "{s}.", .{name});
+            try checkName(abs, "update.keys.name", d);
             const path = try string(try need(kt, "secret_file", "update.keys", d), "update.keys.secret_file", d);
             if (!std.fs.path.isAbsolute(path)) return d.fail("update.keys: secret_file \"{s}\" is not absolute", .{path});
+            ref.* = .{ .name = try wireName(a, abs), .secret_file = path };
+            for (refs[0..i]) |prev| if (std.mem.eql(u8, prev.name, ref.name)) return d.fail("update.keys: duplicate key \"{s}\"", .{name});
         }
+        var u: Update = .{ .keys = refs };
+        if (t.get("max_ttl")) |x| u.max_ttl = try int(u31, x, "update.max_ttl", d);
+        if (t.get("lifetime")) |x| u.lifetime = try int(u31, x, "update.lifetime", d);
+        update = u;
     }
-    return .{ .mode = mode, .listen = listen.items, .zones = zones.items, .forwarding = forwarding };
+    return .{ .mode = mode, .listen = listen.items, .zones = zones.items, .forwarding = forwarding, .update = update };
 }
 
-const record_types = .{ "a", "aaaa", "cname", "ns", "ptr", "mx", "srv", "txt" };
+const record_types = .{ "a", "aaaa", "cname", "ns", "ptr", "mx", "srv", "txt", "caa" };
 
 /// Type codes and the wire RDATA of one record value, built while validating it.
 const Record = struct { type: wire.Type, rdata: []const u8 };
@@ -309,6 +332,20 @@ fn checkRecord(a: Allocator, rtype: []const u8, r: Value, origin: []const u8, ct
         inline for (.{ "priority", "weight", "port" }) |k| try appendInt(a, &out, u16, try int(u16, try need(t, k, ctx, d), ctx, d));
         try out.appendSlice(a, try wireName(a, try absName(a, try string(try need(t, "target", ctx, d), ctx, d), origin, ctx, d)));
         return .{ .type = .srv, .rdata = out.items };
+    } else if (eql(u8, rtype, "caa")) {
+        // RFC 8659: flags, a tag of 1-15 letters or digits, a value of any length.
+        const t = try table(r, ctx, d);
+        try checkKeys(t, &.{ "flags", "tag", "value" }, ctx, d);
+        const tag = try string(try need(t, "tag", ctx, d), ctx, d);
+        if (tag.len == 0 or tag.len > 15) return d.fail("{s}: tag \"{s}\" is not 1 to 15 characters", .{ ctx, tag });
+        for (tag) |c| if (!std.ascii.isAlphanumeric(c)) return d.fail("{s}: tag \"{s}\" is not alphanumeric", .{ ctx, tag });
+        const value = try string(try need(t, "value", ctx, d), ctx, d);
+        var out: std.ArrayList(u8) = .empty;
+        try out.append(a, try int(u8, try need(t, "flags", ctx, d), ctx, d));
+        try out.append(a, @intCast(tag.len));
+        try out.appendSlice(a, tag);
+        try out.appendSlice(a, value);
+        return .{ .type = .caa, .rdata = out.items };
     } else unreachable; // checkKeys allowed only record_types
 }
 
@@ -346,6 +383,9 @@ const good_zone =
     \\
     \\[names."_imaps._tcp"]
     \\srv = [{ priority = 10, weight = 0, port = 993, target = "mail.soto.example.org." }]
+    \\
+    \\[names."web"]
+    \\caa = [{ flags = 0, tag = "issue", value = "letsencrypt.org" }]
 ;
 
 fn expectZone(text: []const u8, want: ?[]const u8) !void {
@@ -396,7 +436,11 @@ test "every invalid zone is rejected" {
         .{ "a = [\"10.100.0.2\"]", "a = [\"fd12::1\"]", "not an IPv4 address" },
         .{ "aaaa = [\"fd12:3456:789a::1\"]", "aaaa = [\"10.0.0.1\"]", "not an IPv6 address" },
         .{ "aaaa = [\"fd12:3456:789a::1\"]", "aaaa = \"fd12::1\"", "expected an array" },
-        .{ "txt = [\"v=spf1 -all\"]", "caa = [\"x\"]", "unknown key \"caa\"" },
+        .{ "txt = [\"v=spf1 -all\"]", "caa = [\"x\"]", "expected a table" },
+        .{ "tag = \"issue\"", "tag = \"issue wild\"", "not alphanumeric" },
+        .{ "tag = \"issue\"", "tag = \"\"", "not 1 to 15" },
+        .{ "flags = 0", "flags = 256", "out of range" },
+        .{ "flags = 0, ", "", "missing \"flags\"" },
         .{ "[names.\"git\"]", "[names.\"Git\"]", "character 'G'" },
         .{ "[names.\"git\"]", "[names.\"git.example.net.\"]", "outside uchi.example.org." },
         .{ "[names.\"git\"]", "[names.\"a..b\"]", "label of 0 bytes" },
@@ -442,6 +486,10 @@ test "annai.toml" {
     try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\nmax_ttl = 2147483648", "out of range");
     try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\ncache_bytes = -1", "out of range");
     try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/run/secrets/k\"", null);
+    try expectConfig(soto ++ "[update]\nmax_ttl = 60\nlifetime = 600\n[[update.keys]]\nname = \"hanko.example.org.\"\nsecret_file = \"/run/secrets/k\"", null);
+    try expectConfig(soto ++ "[update]\nmax_tll = 60\n[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/k\"", "unknown key \"max_tll\"");
+    try expectConfig(soto ++ "[update]\nlifetime = -1\n[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/k\"", "out of range");
+    try expectConfig(soto ++ "[[update.keys]]\nname = \"Hanko\"\nsecret_file = \"/k\"", "character 'H'");
 
     try expectConfig("listen = [\"0.0.0.0:53\"]", "missing \"mode\"");
     try expectConfig("mode = \"saki\"\nlisten = [\"0.0.0.0:53\"]", "not uchi or soto");
@@ -456,5 +504,5 @@ test "annai.toml" {
     try expectConfig(uchi ++ "[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/k\"", "only allowed in soto mode");
     try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret_file = \"k\"", "is not absolute");
     try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret = \"c2VjcmV0\"", "unknown key \"secret\"");
-    try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/a\"\n[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/b\"", "duplicate key");
+    try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/a\"\n[[update.keys]]\nname = \"hanko.\"\nsecret_file = \"/b\"", "duplicate key");
 }

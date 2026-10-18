@@ -31,10 +31,15 @@ let
       };
     }
     // lib.optionalAttrs (cfg.update.keys != { }) {
-      update.keys = lib.mapAttrsToList (name: key: {
-        inherit name;
-        secret_file = key.secretFile;
-      }) cfg.update.keys;
+      update = {
+        # The path LoadCredential gives the unit (nix/module.nix), not the secret's own path.
+        keys = lib.mapAttrsToList (name: _: {
+          inherit name;
+          secret_file = "/run/credentials/annai.service/tsig-${name}";
+        }) cfg.update.keys;
+        max_ttl = cfg.update.maxTtl;
+        inherit (cfg.update) lifetime;
+      };
     }
   );
 in

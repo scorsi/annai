@@ -40,6 +40,9 @@ cname = "vm.kekkai"
 
 [names."_imaps._tcp"]
 srv = [{ priority = 10, weight = 0, port = 993, target = "mail.soto.example.org." }]
+
+[names."soto"]
+caa = [{ flags = 0, tag = "issue", value = "letsencrypt.org" }]   # v1 (ADR 0007), RFC 8659
 ```
 
   Keys are relative to `origin` unless they end with a dot. Record values are arrays (RRsets); `cname` is a single value and excludes other types on the same name (validated).

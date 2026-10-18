@@ -17,6 +17,8 @@ pub const WriteError = error{ NoSpace, Malformed };
 
 pub const Type = enum(u16) { a = 1, ns = 2, cname = 5, soa = 6, ptr = 12, hinfo = 13, mx = 15, txt = 16, aaaa = 28, srv = 33, opt = 41, tsig = 250, any = 255, caa = 257, _ };
 pub const Class = enum(u16) { in = 1, none = 254, any = 255, _ };
+/// Header RCODEs (RFC 1035, 2136, 8945); upstreams may send any value.
+pub const Rcode = enum(u4) { noerror = 0, formerr = 1, servfail = 2, nxdomain = 3, notimp = 4, refused = 5, yxdomain = 6, yxrrset = 7, nxrrset = 8, notauth = 9, notzone = 10, _ };
 
 /// The second header word; the first field is the least significant bit.
 pub const Flags = packed struct(u16) {
@@ -70,6 +72,8 @@ pub const Message = struct {
     answer: []const RR = &.{},
     authority: []const RR = &.{},
     additional: []const RR = &.{},
+    /// Offset of the last additional RR when it is a TSIG (RFC 8945): the signed bytes end there.
+    tsig_at: ?usize = null,
 
     pub fn parse(a: Allocator, packet: []const u8) ParseError!Message {
         var r: Reader = .{ .buf = packet };
@@ -85,10 +89,12 @@ pub const Message = struct {
         const qs = try a.alloc(Question, qd);
         for (qs) |*q| q.* = .{ .name = try parseName(a, &r), .type = @enumFromInt(try r.int(u16)), .class = @enumFromInt(try r.int(u16)) };
         m.question = qs;
-        m.answer = try parseRRs(a, &r, an);
-        m.authority = try parseRRs(a, &r, ns);
-        m.additional = try parseRRs(a, &r, ar);
+        var last: usize = 0;
+        m.answer = try parseRRs(a, &r, an, &last);
+        m.authority = try parseRRs(a, &r, ns, &last);
+        m.additional = try parseRRs(a, &r, ar, &last);
         if (r.pos != packet.len) return error.Malformed;
+        if (ar > 0 and m.additional[ar - 1].type == .tsig) m.tsig_at = last;
         return m;
     }
 
@@ -145,18 +151,19 @@ fn layout(t: Type) ?[]const Field {
     };
 }
 
-const Reader = struct {
+pub const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
 
-    fn take(r: *Reader, n: usize) error{Malformed}![]const u8 {
+    pub fn take(r: *Reader, n: usize) error{Malformed}![]const u8 {
         if (r.buf.len - r.pos < n) return error.Malformed;
         defer r.pos += n;
         return r.buf[r.pos..][0..n];
     }
 
-    fn int(r: *Reader, comptime T: type) error{Malformed}!T {
-        return std.mem.readInt(T, (try r.take(@sizeOf(T)))[0..@sizeOf(T)], .big);
+    pub fn int(r: *Reader, comptime T: type) error{Malformed}!T {
+        const n = @divExact(@bitSizeOf(T), 8);
+        return std.mem.readInt(T, (try r.take(n))[0..n], .big);
     }
 
     /// Reads a possibly compressed name into `out`. Every pointer must point strictly before
@@ -197,9 +204,11 @@ fn parseName(a: Allocator, r: *Reader) ParseError![]const u8 {
     return a.dupe(u8, try r.name(&tmp));
 }
 
-fn parseRRs(a: Allocator, r: *Reader, count: u16) ParseError![]const RR {
+/// `last` receives the offset of the last RR read, when there is one.
+fn parseRRs(a: Allocator, r: *Reader, count: u16, last: *usize) ParseError![]const RR {
     const rrs = try a.alloc(RR, count);
     for (rrs) |*rr| {
+        last.* = r.pos;
         rr.name = try parseName(a, r);
         rr.type = @enumFromInt(try r.int(u16));
         rr.class = @enumFromInt(try r.int(u16));

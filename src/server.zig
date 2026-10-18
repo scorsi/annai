@@ -21,6 +21,8 @@ const poll = @import("poll.zig");
 const wire = @import("wire.zig");
 const config = @import("config.zig");
 const forward = @import("forward.zig");
+const tsig = @import("tsig.zig");
+const update = @import("update.zig");
 
 const max_message = 65535;
 const idle_timeout_ms = 10_000; // RFC 7766 §6.2.3: a few seconds of idle time
@@ -92,6 +94,10 @@ pub const Server = struct {
     arena: std.heap.ArenaAllocator,
     forwarding: ?config.Forwarding,
     cache: forward.Cache,
+    /// soto only (ADR 0006): the TSIG keys and the dynamic records.
+    keys: []const tsig.Key,
+    overlay: update.Overlay,
+    soto: bool,
     /// Poller tokens `slots.len + i`.
     pending: [max_pending]?Pending = @splat(null),
     next_gen: u64 = 0,
@@ -102,7 +108,9 @@ pub const Server = struct {
     up: [2 + max_message]u8 = undefined,
 
     /// Binds every address (UDP and TCP) and serves forever.
-    pub fn run(gpa: std.mem.Allocator, zones: []const zone.Zone, listen: []const net.IpAddress, forwarding: ?config.Forwarding) !void {
+    pub fn run(gpa: std.mem.Allocator, zones: []const zone.Zone, cfg: config.Config, keys: []const tsig.Key) !void {
+        const listen = cfg.listen;
+        const caps: config.Update = cfg.update orelse .{ .keys = &.{} };
         const s = try gpa.create(Server);
         defer gpa.destroy(s);
         s.* = .{
@@ -111,12 +119,16 @@ pub const Server = struct {
             .poller = try poll.Poller.init(),
             .slots = try gpa.alloc(Slot, 2 * listen.len + max_conns),
             .arena = std.heap.ArenaAllocator.init(gpa),
-            .forwarding = forwarding,
-            .cache = .init(gpa, if (forwarding) |f| f.cache_bytes else 0),
+            .forwarding = cfg.forwarding,
+            .cache = .init(gpa, if (cfg.forwarding) |f| f.cache_bytes else 0),
+            .keys = keys,
+            .overlay = .init(gpa, caps.max_ttl, caps.lifetime),
+            .soto = cfg.mode == .soto,
         };
         defer gpa.free(s.slots);
         defer s.arena.deinit();
         defer s.cache.deinit();
+        defer s.overlay.deinit();
         @memset(s.slots, .free);
         for (listen, 0..) |addr, i| {
             const udp = try open(addr, posix.SOCK.DGRAM);
@@ -146,6 +158,7 @@ pub const Server = struct {
                 }
             }
             const now = nowMs();
+            s.overlay.expire(@divTrunc(now, 1000));
             for (s.slots, 0..) |slot, i| if (slot == .conn and slot.conn.deadline <= now) s.close(i);
             for (&s.pending, 0..) |*p, i| if (p.* != null and p.*.?.deadline <= now) {
                 std.debug.print("level=warn event=upstream-timeout upstream={f}\n", .{s.forwarding.?.upstreams[p.*.?.upstream]});
@@ -157,7 +170,8 @@ pub const Server = struct {
     fn respond(s: *Server, packet: []const u8, transport: engine.Transport, to: ReplyTo) ?[]const u8 {
         defer _ = s.arena.reset(.retain_capacity);
         var fwd: ?engine.Forward = null;
-        const n = engine.respond(s.arena.allocator(), s.zones, packet, s.out[2..], transport, if (s.forwarding != null) &fwd else null) orelse
+        const ctx: engine.Context = .{ .zones = s.zones, .keys = s.keys, .overlay = if (s.soto) &s.overlay else null, .now = nowUnix(), .mono = @divTrunc(nowMs(), 1000) };
+        const n = engine.respond(s.arena.allocator(), ctx, packet, s.out[2..], transport, if (s.forwarding != null) &fwd else null) orelse
             return if (fwd) |f| s.forwardQuery(f, to) else null;
         return s.out[2 .. 2 + n];
     }
@@ -512,4 +526,11 @@ fn nowMs() i64 {
     var ts: posix.timespec = undefined;
     _ = sys.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
+/// Wall-clock seconds, the only thing TSIG's time check can compare with the client's.
+fn nowUnix() i64 {
+    var ts: posix.timespec = undefined;
+    _ = sys.clock_gettime(posix.CLOCK.REALTIME, &ts);
+    return @intCast(ts.sec);
 }

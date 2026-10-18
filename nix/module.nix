@@ -80,12 +80,28 @@ in
           options.secretFile = mkOption {
             type = types.str;
             example = "/run/secrets/annai-tsig-hanko";
-            description = "Absolute path to the file holding the HMAC-SHA256 secret (a sops secret path, never a value).";
+            description = ''
+              Absolute path to the file holding the HMAC-SHA256 secret (a sops secret path, never a
+              value): one line, the base64 secret, optionally prefixed with `<key name>:` as in
+              hanko's key files. Read by root through `LoadCredential`, so a `0400` root file works.
+            '';
           };
         }
       );
       default = { };
       description = "TSIG keys allowed to send RFC 2136 updates, by key name (ADR 0006). `soto` mode only.";
+    };
+
+    update.maxTtl = mkOption {
+      type = types.ints.between 0 2147483647;
+      default = 120;
+      description = "Cap on the TTL of a dynamic `_acme-challenge` TXT record, in seconds (ADR 0006).";
+    };
+
+    update.lifetime = mkOption {
+      type = types.ints.between 0 2147483647;
+      default = 3600;
+      description = "Seconds a dynamic record stays in memory, whatever its TTL, unless the client deletes it (ADR 0006).";
     };
 
     zones = mkOption {
@@ -150,6 +166,8 @@ in
         ExecStart = "${lib.getExe cfg.package} serve ${cfg.configFile}";
         Restart = "on-failure";
         RestartSec = "2s";
+        # TSIG secrets stay root-owned on disk; systemd hands them to the dynamic user (ADR 0006).
+        LoadCredential = lib.mapAttrsToList (name: key: "tsig-${name}:${key.secretFile}") cfg.update.keys;
         # annai never writes to disk (ADR 0003) and only needs to bind port 53.
         DynamicUser = true;
         AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];

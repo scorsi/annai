@@ -57,6 +57,25 @@ pub fn lower(name: []u8) []u8 {
     return std.ascii.lowerString(name, name);
 }
 
+/// `{f}` prints a wire name in presentation form, for the logs; bytes that are not printable
+/// ASCII (the name may come off the wire) show as `?`.
+pub fn fmt(name: []const u8) Formatter {
+    return .{ .name = name };
+}
+
+pub const Formatter = struct {
+    name: []const u8,
+
+    pub fn format(f: Formatter, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (f.name.len <= 1) return w.writeAll(".");
+        var i: usize = 0;
+        while (i < f.name.len and f.name[i] != 0) : (i += 1 + f.name[i]) {
+            for (f.name[i + 1 ..][0..@min(f.name[i], f.name.len - i - 1)]) |c| try w.writeByte(if (std.ascii.isPrint(c) and c != ' ') c else '?');
+            try w.writeByte('.');
+        }
+    }
+};
+
 const testing = std.testing;
 
 test "isUnder respects label boundaries" {
@@ -68,6 +87,13 @@ test "isUnder respects label boundaries" {
     try testing.expect(!isUnder(try wire.nameFromText(&buf, "notexample.org."), origin));
     try testing.expect(!isUnder(try wire.nameFromText(&buf, "org."), origin));
     try testing.expect(!isUnder(try wire.nameFromText(&buf, "example.net."), origin));
+}
+
+test "fmt prints presentation form" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("hub.kekkai.", try std.fmt.bufPrint(&buf, "{f}", .{fmt("\x03hub\x06kekkai\x00")}));
+    try testing.expectEqualStrings(".", try std.fmt.bufPrint(&buf, "{f}", .{fmt("\x00")}));
+    try testing.expectEqualStrings("a?b.", try std.fmt.bufPrint(&buf, "{f}", .{fmt("\x03a\x01b\x00")}));
 }
 
 test "lower keeps the label lengths" {

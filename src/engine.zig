@@ -1,12 +1,16 @@
 //! Authoritative responder (ADR 0007 v0): one query packet in, one response packet out. Transport
 //! independent: the caller says how many bytes the transport allows (`udp` caps at the EDNS
-//! payload, 512 without OPT) and the engine sets TC when the answer does not fit.
+//! payload, 512 without OPT) and the engine sets TC when the answer does not fit. A TSIG-signed
+//! message is verified before anything else and its response signed (ADR 0006); UPDATEs go to
+//! `update.zig`, whose overlay is consulted after the static data.
 
 const std = @import("std");
 const wire = @import("wire.zig");
 const zone = @import("zone.zig");
+const tsig = @import("tsig.zig");
+const update = @import("update.zig");
 
-pub const Rcode = enum(u4) { noerror = 0, formerr = 1, servfail = 2, nxdomain = 3, notimp = 4, refused = 5 };
+pub const Rcode = wire.Rcode;
 
 /// RFC 6891 §6.2.3 and DNS Flag Day 2020: never trust a payload above 1232 or below 512.
 pub const max_udp_payload = 1232;
@@ -16,6 +20,17 @@ const hinfo_rfc8482 = "\x07RFC8482\x00";
 const max_cname_hops = 8;
 
 pub const Transport = enum { udp, tcp };
+
+/// What the engine answers from: the zones and, in soto mode, the TSIG keys and the overlay.
+pub const Context = struct {
+    zones: []const zone.Zone,
+    keys: []const tsig.Key = &.{},
+    /// Null in uchi mode: every UPDATE is REFUSED (ADR 0006).
+    overlay: ?*update.Overlay = null,
+    /// Wall-clock seconds (TSIG) and monotonic seconds (overlay lifetimes).
+    now: i64 = 0,
+    mono: i64 = 0,
+};
 
 /// A query for a name outside the local zones, for the caller to forward (uchi mode, ADR 0008).
 pub const Forward = struct {
@@ -32,7 +47,7 @@ pub const Forward = struct {
 /// Writes the response to `query` into `out` and returns its length, or null when the packet
 /// deserves no answer (shorter than a header, or itself a response). With `forward`, a valid
 /// query outside the zones is not REFUSED: it is stored there and null is returned.
-pub fn respond(arena: std.mem.Allocator, zones: []const zone.Zone, query: []const u8, out: []u8, transport: Transport, forward: ?*?Forward) ?usize {
+pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: []u8, transport: Transport, forward: ?*?Forward) ?usize {
     if (query.len < 12) return null;
     const id = std.mem.readInt(u16, query[0..2], .big);
     const qflags: wire.Flags = @bitCast(std.mem.readInt(u16, query[2..4], .big));
@@ -42,6 +57,7 @@ pub fn respond(arena: std.mem.Allocator, zones: []const zone.Zone, query: []cons
         // A forwarding server offers recursion on every answer, local ones included (RFC 1035 §4.1.1).
         .flags = .{ .qr = true, .opcode = qflags.opcode, .rd = qflags.rd, .ra = forward != null },
         .limit = if (transport == .tcp) out.len else min_udp_payload,
+        .now = ctx.now,
     };
     const msg = wire.Message.parse(arena, query) catch |e| switch (e) {
         error.Malformed => return r.finish(id, out, .formerr),
@@ -59,22 +75,31 @@ pub fn respond(arena: std.mem.Allocator, zones: []const zone.Zone, query: []cons
     if (msg.question.len != 1) return r.finish(id, out, .formerr);
     const q = msg.question[0];
     r.question = q;
+    // A signed message is verified before it is acted upon; a failure is NOTAUTH with the TSIG
+    // error in the response (unsigned for BADKEY and BADSIG, signed for BADTIME, RFC 8945 §5.2).
+    r.tsig = tsig.verify(ctx.keys, query, msg, ctx.now) catch return r.finish(id, out, .formerr);
+    if (r.tsig) |t| if (t.err != .none) {
+        std.debug.print("level=warn event=tsig code={s} key={f}\n", .{ @tagName(t.err), zone.fmt(t.name) });
+        return r.finish(id, out, .notauth);
+    };
+    if (qflags.opcode == 5) return r.finish(id, out, update.apply(ctx.overlay, ctx.zones, msg, if (r.tsig) |t| t.key.?.name else null, ctx.mono));
     if (qflags.opcode != 0) return r.finish(id, out, .notimp);
     if (q.class != .in) return r.finish(id, out, .refused);
 
     var lowered: [255]u8 = undefined;
     @memcpy(lowered[0..q.name.len], q.name);
     const qname = zone.lower(lowered[0..q.name.len]);
-    const z = zone.find(zones, qname) orelse {
+    const z = zone.find(ctx.zones, qname) orelse {
         const f = forward orelse return r.finish(id, out, .refused);
         f.* = .{ .id = id, .rd = qflags.rd, .question = q, .opt = r.opt, .limit = r.limit };
         return null;
     };
     r.flags.aa = true;
+    const overlay = ctx.overlay;
 
     if (q.type == .any) {
         // RFC 8482: a synthetic HINFO when the name exists, whatever it holds.
-        if (z.lookup(qname) == null) return r.negative(id, out, z, .nxdomain);
+        if (z.lookup(qname) == null and !(overlay != null and overlay.?.exists(qname))) return r.negative(id, out, z, .nxdomain);
         r.answer(.{ .name = q.name, .type = .hinfo, .ttl = z.soa.ttl, .rdata = hinfo_rfc8482 });
         return r.finish(id, out, .noerror);
     }
@@ -82,11 +107,14 @@ pub fn respond(arena: std.mem.Allocator, zones: []const zone.Zone, query: []cons
     var owner: []const u8 = qname;
     var hops: usize = 0;
     while (true) : (hops += 1) {
-        const name = z.lookup(owner) orelse return r.negative(id, out, z, .nxdomain);
-        if (name.get(q.type)) |set| {
-            for (set.rdatas) |rd| r.answer(.{ .name = owner, .type = set.type, .ttl = set.ttl, .rdata = rd });
-            return r.finish(id, out, .noerror);
-        }
+        const before = r.n_answers;
+        const static = z.lookup(owner);
+        if (static) |name| if (name.get(q.type)) |set| for (set.rdatas) |rd| r.answer(.{ .name = owner, .type = set.type, .ttl = set.ttl, .rdata = rd });
+        // ADR 0006: dynamic records come after the static ones, never instead of them.
+        if (overlay) |o| if (q.type == .txt) for (o.records.items) |rec| if (std.mem.eql(u8, rec.name, owner)) r.answer(.{ .name = owner, .type = .txt, .ttl = rec.ttl, .rdata = rec.rdata });
+        if (r.n_answers > before) return r.finish(id, out, .noerror);
+        // A name with dynamic records below it exists (ADR 0004): NODATA, not NXDOMAIN.
+        const name = static orelse return r.negative(id, out, z, if (overlay != null and overlay.?.exists(owner)) .noerror else .nxdomain);
         const cname = name.get(.cname) orelse return r.negative(id, out, z, .noerror);
         r.answer(.{ .name = owner, .type = .cname, .ttl = cname.ttl, .rdata = cname.rdatas[0] });
         owner = cname.rdatas[0];
@@ -118,8 +146,10 @@ pub fn forwarded(arena: std.mem.Allocator, f: Forward, upstream: ?[]const u8, tt
 const Response = struct {
     flags: wire.Flags,
     limit: usize,
+    now: i64 = 0,
     question: ?wire.Question = null,
     opt: ?wire.Opt = null,
+    tsig: ?tsig.Status = null,
     answers: [64]wire.RR = undefined,
     n_answers: usize = 0,
     authority: ?wire.RR = null,
@@ -140,9 +170,10 @@ const Response = struct {
 
     fn finish(r: *Response, id: u16, out: []u8, rcode: Rcode) ?usize {
         r.flags.rcode = @intFromEnum(rcode);
-        // The OPT is written last but must always fit: its 11 bytes are reserved up front.
-        const reserved: usize = if (r.opt != null) 11 else 0;
-        const body = out[0..@min(r.limit, out.len) - reserved];
+        // The OPT and the TSIG are written last but must always fit: their bytes are reserved up front.
+        const opt_len: usize = if (r.opt != null) 11 else 0;
+        const tsig_len: usize = if (r.tsig) |t| t.size() else 0;
+        const body = out[0 .. @min(r.limit, out.len) - opt_len - tsig_len];
         var w = wire.Writer.init(body, id, r.flags) catch unreachable; // out is a response buffer
         if (r.question) |q| w.question(q) catch {
             r.flags.tc = true;
@@ -165,10 +196,10 @@ const Response = struct {
         }
         std.mem.writeInt(u16, out[2..4], @bitCast(r.flags), .big);
         if (r.opt) |o| {
-            w.buf = out[0 .. body.len + reserved];
+            w.buf = out[0 .. body.len + opt_len];
             w.rr(.additional, o.toRR()) catch unreachable; // 11 bytes were reserved
         }
-        return w.len;
+        return if (r.tsig) |t| tsig.sign(t, out, w.len, r.now) else w.len;
     }
 };
 
@@ -212,9 +243,32 @@ const test_zone_head =
 /// Eight TXT strings of 255 bytes (the first one 256, so it is split): over 2 KiB of RDATA.
 const test_zone = test_zone_head ++ "\"" ++ "y" ** 256 ++ "\",\n" ++ ("\"" ++ "x" ** 255 ++ "\",\n") ** 7 ++ "]\n";
 
+/// The public apex of ADR 0004: no `uchi` names, a CAA record.
+const apex_zone =
+    \\origin = "example.org."
+    \\ttl = 300
+    \\serial = 1
+    \\[soa]
+    \\mname = "ns1"
+    \\rname = "hostmaster"
+    \\refresh = 3600
+    \\retry = 600
+    \\expire = 604800
+    \\minimum = 60
+    \\[names."@"]
+    \\ns = ["ns1"]
+    \\caa = [{ flags = 0, tag = "issue", value = "letsencrypt.org" }]
+    \\[names."ns1"]
+    \\a = ["192.0.2.53"]
+;
+
 const Fixture = struct {
     arena: std.heap.ArenaAllocator,
-    zones: [1]zone.Zone,
+    zones: [2]zone.Zone,
+    overlay: update.Overlay,
+    keys: [1]tsig.Key = .{tsig.vector.key},
+    /// uchi by default; `soto()` turns the keys and the overlay on.
+    ctx: Context = undefined,
     out: [65535]u8 = undefined,
     buf: [65535]u8 = undefined,
     last_len: usize = 0,
@@ -222,15 +276,24 @@ const Fixture = struct {
     fn init() !*Fixture {
         const f = try testing.allocator.create(Fixture);
         f.arena = std.heap.ArenaAllocator.init(testing.allocator);
+        f.overlay = update.Overlay.init(testing.allocator, 120, 3600);
+        f.keys = .{tsig.vector.key};
         var d: config.Diag = .{};
-        f.zones[0] = config.loadZone(f.arena.allocator(), test_zone, &d) catch |e| {
+        for (&f.zones, [_][]const u8{ test_zone, apex_zone }) |*z, text| z.* = config.loadZone(f.arena.allocator(), text, &d) catch |e| {
             std.debug.print("{s}\n", .{d.msg});
             return e;
         };
+        f.ctx = .{ .zones = &f.zones };
         return f;
     }
 
+    /// The public view (ADR 0004): the apex zone only, with the keys and the overlay.
+    fn soto(f: *Fixture, now: i64) void {
+        f.ctx = .{ .zones = f.zones[1..2], .keys = &f.keys, .overlay = &f.overlay, .now = now, .mono = 1000 };
+    }
+
     fn deinit(f: *Fixture) void {
+        f.overlay.deinit();
         f.arena.deinit();
         testing.allocator.destroy(f);
     }
@@ -250,7 +313,7 @@ const Fixture = struct {
     }
 
     fn reply(f: *Fixture, packet: []const u8, transport: Transport) !wire.Message {
-        const n = respond(f.arena.allocator(), &f.zones, packet, &f.out, transport, null) orelse return error.NoResponse;
+        const n = respond(f.arena.allocator(), f.ctx, packet, &f.out, transport, null) orelse return error.NoResponse;
         f.last_len = n;
         return wire.Message.parse(f.arena.allocator(), f.out[0..n]);
     }
@@ -331,14 +394,20 @@ test "CNAME: in-zone targets are chased, out-of-zone and dangling ones are not" 
 test "REFUSED outside the zones, NOTIMP for other opcodes, ANY is HINFO" {
     const f = try Fixture.init();
     defer f.deinit();
-    const refused = try f.ask(.{ .name = "example.org." });
+    const refused = try f.ask(.{ .name = "example.net." });
     try expectRcode(refused, .refused);
     try testing.expect(!refused.flags.aa);
-    try expectRcode(try f.ask(.{ .name = "notuchi.example.org." }), .refused);
+    try expectRcode(try f.ask(.{ .name = "notuchi.example.net." }), .refused);
     try expectRcode(try f.ask(.{ .name = "hub.kekkai.uchi.example.org.", .class = .any }), .refused);
-    const notimp = try f.ask(.{ .name = "hub.kekkai.uchi.example.org.", .opcode = 5 });
+    const notimp = try f.ask(.{ .name = "hub.kekkai.uchi.example.org.", .opcode = 6 });
     try expectRcode(notimp, .notimp);
-    try testing.expectEqual(@as(u4, 5), notimp.flags.opcode);
+    try testing.expectEqual(@as(u4, 6), notimp.flags.opcode);
+    // ADR 0006: uchi answers REFUSED to any UPDATE.
+    const upd = try f.ask(.{ .name = "uchi.example.org.", .type = .soa, .opcode = 5 });
+    try expectRcode(upd, .refused);
+    try testing.expectEqual(@as(u4, 5), upd.flags.opcode);
+    const caa = try f.ask(.{ .name = "example.org.", .type = .caa });
+    try testing.expectEqualSlices(u8, "\x00\x05issueletsencrypt.org", caa.answer[0].rdata);
     const any = try f.ask(.{ .name = "hub.kekkai.uchi.example.org.", .type = .any });
     try expectRcode(any, .noerror);
     try testing.expectEqual(wire.Type.hinfo, any.answer[0].type);
@@ -396,13 +465,13 @@ test "forwarding: names outside the zones are handed over, answers get RA, the T
     var nbuf: [255]u8 = undefined;
     const query: wire.Message = .{ .id = 0x1234, .flags = .{ .rd = true }, .question = &.{.{ .name = try wire.nameFromText(&nbuf, "WwW.example.NET."), .type = .txt }}, .additional = &.{(wire.Opt{ .payload = 4096 }).toRR()} };
     var fwd: ?Forward = null;
-    try testing.expectEqual(@as(?usize, null), respond(a, &f.zones, f.buf[0..try query.encode(&f.buf)], &f.out, .udp, &fwd));
+    try testing.expectEqual(@as(?usize, null), respond(a, f.ctx, f.buf[0..try query.encode(&f.buf)], &f.out, .udp, &fwd));
     const q = fwd.?;
     try testing.expect(q.rd and q.limit == max_udp_payload and q.opt != null);
     // A local name is still answered, with forwarding enabled.
     fwd = null;
     const local: wire.Message = .{ .id = 1, .question = &.{.{ .name = "\x03hub\x06kekkai\x04uchi\x07example\x03org\x00", .type = .a }} };
-    const n = respond(a, &f.zones, f.buf[0..try local.encode(&f.buf)], &f.out, .udp, &fwd).?;
+    const n = respond(a, f.ctx, f.buf[0..try local.encode(&f.buf)], &f.out, .udp, &fwd).?;
     const answered = try wire.Message.parse(a, f.out[0..n]);
     try testing.expect(fwd == null and answered.flags.aa and answered.flags.ra and answered.answer.len == 1);
 
@@ -439,4 +508,60 @@ fn expectForwarded(m: wire.Message, rcode: Rcode) !void {
     try testing.expectEqual(rcode, @as(Rcode, @enumFromInt(m.flags.rcode)));
     try testing.expectEqual(@as(u16, 0x1234), m.id);
     try testing.expect(m.flags.qr and m.flags.rd and m.flags.ra and !m.flags.aa);
+}
+
+test "soto: BIND's signed UPDATE is applied and answered signed; the overlay is served after the static data" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    f.soto(tsig.vector.time);
+    var pbuf: [256]u8 = undefined;
+    const pkt = tsig.vector.packet(&pbuf);
+    const ack = try f.reply(pkt, .udp);
+    try testing.expectEqual(Rcode.noerror, @as(Rcode, @enumFromInt(ack.flags.rcode)));
+    try testing.expect(ack.flags.qr and ack.flags.opcode == 5 and !ack.flags.ra and ack.id == 0x6cb3);
+    try testing.expectEqual(wire.Type.soa, ack.question[0].type);
+    try testing.expectEqual(wire.Type.tsig, ack.additional[0].type);
+    try testing.expect(ack.tsig_at != null);
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, tsig.vector.response_mac);
+    try testing.expectEqualSlices(u8, &want, f.out[f.last_len - 38 .. f.last_len - 6]);
+    try testing.expectEqual(@as(usize, 1), f.overlay.records.items.len);
+
+    const challenge = "_ACME-challenge.git.uchi.example.org.";
+    const txt = try f.ask(.{ .name = challenge, .type = .txt });
+    try expectRcode(txt, .noerror);
+    try testing.expect(txt.flags.aa and txt.additional.len == 0); // an unsigned query gets an unsigned answer
+    try testing.expectEqual(@as(usize, 1), txt.answer.len);
+    try testing.expectEqualSlices(u8, "\x04tok1", txt.answer[0].rdata);
+    try testing.expectEqual(@as(u32, 60), txt.answer[0].ttl);
+    // The names above the challenge exist in the public view (ADR 0004): NODATA, not NXDOMAIN.
+    for ([_][]const u8{ "git.uchi.example.org.", "uchi.example.org." }) |name| {
+        const m = try f.ask(.{ .name = name });
+        try expectRcode(m, .noerror);
+        try testing.expect(m.answer.len == 0 and m.authority.len == 1 and m.authority[0].type == .soa);
+    }
+    try expectRcode(try f.ask(.{ .name = "vm.uchi.example.org." }), .nxdomain);
+    try expectRcode(try f.ask(.{ .name = challenge, .type = .a }), .noerror);
+    try testing.expectEqual(wire.Type.hinfo, (try f.ask(.{ .name = challenge, .type = .any })).answer[0].type);
+    // Replayed outside the fudge: BADTIME, signed, nothing applied; a bad key: unsigned NOTAUTH.
+    f.soto(tsig.vector.time + 301);
+    const late = try f.reply(pkt, .udp);
+    try testing.expectEqual(Rcode.notauth, @as(Rcode, @enumFromInt(late.flags.rcode)));
+    try testing.expectEqual(@as(usize, 1), late.additional.len);
+    try testing.expectEqual(@as(u16, 18), std.mem.readInt(u16, f.out[f.last_len - 10 ..][0..2], .big));
+    f.keys[0].secret = "wrong";
+    f.soto(tsig.vector.time);
+    const badsig = try f.reply(pkt, .udp);
+    try testing.expectEqual(Rcode.notauth, @as(Rcode, @enumFromInt(badsig.flags.rcode)));
+    try testing.expectEqual(@as(u16, 16), std.mem.readInt(u16, f.out[f.last_len - 4 ..][0..2], .big));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, f.out[f.last_len - 8 ..][0..2], .big)); // MAC size: unsigned
+    f.keys[0].secret = tsig.vector.secret;
+    // Unsigned UPDATE: REFUSED without touching the overlay; the signed request's zone is echoed either way.
+    var unsigned: [256]u8 = undefined;
+    @memcpy(unsigned[0 .. pkt.len - 78], pkt[0 .. pkt.len - 78]);
+    unsigned[11] = 0; // ARCOUNT
+    const bare = try f.reply(unsigned[0 .. pkt.len - 78], .udp);
+    try testing.expectEqual(Rcode.refused, @as(Rcode, @enumFromInt(bare.flags.rcode)));
+    try testing.expectEqual(@as(usize, 1), f.overlay.records.items.len);
+    try testing.expectEqual(@as(usize, 0), bare.additional.len);
 }

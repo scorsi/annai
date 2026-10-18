@@ -224,7 +224,10 @@ pub fn loadZone(a: Allocator, text: []const u8, d: *Diag) Error!zone.Zone {
     const names_t = try table(try need(root, "names", origin, d), "names", d);
     for (names_t.keys(), names_t.values()) |key, v| {
         const ctx = try std.fmt.allocPrint(a, "names.\"{s}\"", .{key});
-        const owner = try absName(a, key, origin, ctx, d);
+        // RFC 4592 wildcards (ADR 0007 v1): `*` only as the whole leftmost label of an owner.
+        const wild = std.mem.eql(u8, key, "*") or std.mem.startsWith(u8, key, "*.");
+        const owner = if (wild) try std.mem.concat(a, u8, &.{ "*.", if (key.len == 1) origin else try absName(a, key[2..], origin, ctx, d) }) else try absName(a, key, origin, ctx, d);
+        if (owner.len + 1 > 255) return d.fail("{s}: \"{s}\" is longer than 255 bytes", .{ ctx, owner });
         if (!inZone(owner, origin)) return d.fail("{s}: \"{s}\" is outside {s}", .{ ctx, owner, origin });
         const rrsets = try table(v, ctx, d);
         try checkKeys(rrsets, &record_types, ctx, d);
@@ -386,6 +389,12 @@ const good_zone =
     \\
     \\[names."web"]
     \\caa = [{ flags = 0, tag = "issue", value = "letsencrypt.org" }]
+    \\
+    \\[names."*.wild"]
+    \\a = ["10.100.0.9"]
+    \\
+    \\[names."*"]
+    \\cname = "web"
 ;
 
 fn expectZone(text: []const u8, want: ?[]const u8) !void {
@@ -452,6 +461,14 @@ test "every invalid zone is rejected" {
         .{ "preference = 10", "preference = 10, weight = 1", "unknown key \"weight\"" },
         .{ "exchange = \"mail.soto.example.org.\"", "exchange = \"mail soto\"", "character ' '" },
         .{ "origin = \"uchi.example.org.\"", "origin = = 1", "invalid TOML" },
+        // Wildcards: `*` is a whole leftmost owner label, nothing else (RFC 4592, ADR 0007).
+        .{ "[names.\"*.wild\"]", "[names.\"a.*.wild\"]", "character '*'" },
+        .{ "[names.\"*.wild\"]", "[names.\"*.*.wild\"]", "character '*'" },
+        .{ "[names.\"*.wild\"]", "[names.\"*wild\"]", "character '*'" },
+        .{ "cname = \"web\"", "cname = \"*.wild\"", "character '*'" },
+        // 253 bytes of relative name pass checkName on their own; the `*.` label pushes the owner over.
+        .{ "[names.\"*.wild\"]", "[names.\"*." ++ ("x" ** 60 ++ ".") ** 3 ++ "x" ** 52 ++ "\"]", "longer than 255 bytes" },
+        .{ "[names.\"*.wild\"]\na = [\"10.100.0.9\"]", "[names.\"*.wild\"]\nns = [\"annai.uchi.example.org.\"]", "NS only at the zone apex" },
     };
     for (cases) |c| {
         const text = try mutate(c[0], c[1]);

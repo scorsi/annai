@@ -14,9 +14,15 @@ pkgs.testers.runNixOSTest {
           ./example.nix
         ];
         # Eight 255-byte strings: over 1232 bytes, so UDP answers are truncated and TCP is needed.
-        services.annai.zones."uchi.example.org.".names.big.txt = map (
-          _: lib.concatStrings (lib.replicate 255 "x")
-        ) (lib.range 1 8);
+        services.annai.zones."uchi.example.org.".names = {
+          big.txt = map (_: lib.concatStrings (lib.replicate 255 "x")) (lib.range 1 8);
+          # Wildcards (RFC 4592): a wildcard with a sibling name, an empty non-terminal below
+          # it, and a wildcard CNAME.
+          "*.wild".a = [ "10.100.0.9" ];
+          "host.wild".a = [ "10.100.0.10" ];
+          "x.ent.wild".a = [ "10.100.0.11" ];
+          "*.alias".cname = "vm.kekkai";
+        };
         # No forwarding (no Internet in the sandbox): names outside the zones stay REFUSED.
         services.annai.forwarding.upstreams = [ ];
         networking.firewall.allowedUDPPorts = [ 53 ];
@@ -97,6 +103,18 @@ pkgs.testers.runNixOSTest {
               assert expected in out, out
           out = q("+noall +answer hub.kekkai.uchi.example.org ANY")
           assert re.search(r'HINFO\s+"RFC8482" ""', out), out
+
+      with subtest("wildcards (RFC 4592)"):
+          for name, addr in [("anything.wild.uchi.example.org", "10.100.0.9"), ("a.b.wild.uchi.example.org", "10.100.0.9"), ("*.wild.uchi.example.org", "10.100.0.9"), ("host.wild.uchi.example.org", "10.100.0.10")]:
+              out = q(f"+noall +comments +answer {name} A")
+              assert "flags: qr aa;" in out and re.search(rf"^{re.escape(name)}\.\s+300\s+IN\s+A\s+{re.escape(addr)}$", out, re.M), out
+          out = q("+noall +answer foo.alias.uchi.example.org A")
+          assert re.search(r"^foo\.alias\.uchi\.example\.org\.\s+300\s+IN\s+CNAME\s+vm\.kekkai\.uchi\.example\.org\.$", out, re.M) and "10.100.0.3" in out, out
+          # No synthesis below an existing name, for an empty non-terminal, below the wildcard
+          # itself, or for a type the wildcard lacks (NODATA).
+          for name, rtype, status in [("sub.host.wild.uchi.example.org", "A", "NXDOMAIN"), ("ent.wild.uchi.example.org", "A", "NOERROR"), ("ghost.*.wild.uchi.example.org", "A", "NXDOMAIN"), ("anything.wild.uchi.example.org", "MX", "NOERROR")]:
+              out = q(f"+noall +comments +authority {name} {rtype}")
+              assert f"status: {status}" in out and "ANSWER: 0" in out and re.search(r"IN\s+SOA", out), out
 
       with subtest("EDNS payload sizing and truncation"):
           out = q("+noedns +ignore +noall +comments +stats big.uchi.example.org TXT")

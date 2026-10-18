@@ -20,7 +20,8 @@ let
 
   isNode =
     owner:
-    builtins.match "[^.]+\\.kekkai\\..*" owner != null && lib.hasSuffix ".kekkai.${reverse.zone}" owner;
+    builtins.match "[^.*]+\\.kekkai\\..*" owner != null
+    && lib.hasSuffix ".kekkai.${reverse.zone}" owner;
   nodes = lib.filterAttrs (owner: _: isNode (abs owner)) forward.names;
   isV6 = lib.hasInfix ":";
   # Most significant label first: four decimal octets, or 32 hex nibbles.

@@ -99,7 +99,7 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
 
     if (q.type == .any) {
         // RFC 8482: a synthetic HINFO when the name exists, whatever it holds.
-        if (z.lookup(qname) == null and !(overlay != null and overlay.?.exists(qname))) return r.negative(id, out, z, .nxdomain);
+        if (lookup(z, overlay, qname) == null and !dynamic(overlay, qname)) return r.negative(id, out, z, .nxdomain);
         r.answer(.{ .name = q.name, .type = .hinfo, .ttl = z.soa.ttl, .rdata = hinfo_rfc8482 });
         return r.finish(id, out, .noerror);
     }
@@ -108,19 +108,43 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
     var hops: usize = 0;
     while (true) : (hops += 1) {
         const before = r.n_answers;
-        const static = z.lookup(owner);
+        const static = lookup(z, overlay, owner);
         if (static) |name| if (name.get(q.type)) |set| for (set.rdatas) |rd| r.answer(.{ .name = owner, .type = set.type, .ttl = set.ttl, .rdata = rd });
         // ADR 0006: dynamic records come after the static ones, never instead of them.
         if (overlay) |o| if (q.type == .txt) for (o.records.items) |rec| if (std.mem.eql(u8, rec.name, owner)) r.answer(.{ .name = owner, .type = .txt, .ttl = rec.ttl, .rdata = rec.rdata });
         if (r.n_answers > before) return r.finish(id, out, .noerror);
         // A name with dynamic records below it exists (ADR 0004): NODATA, not NXDOMAIN.
-        const name = static orelse return r.negative(id, out, z, if (overlay != null and overlay.?.exists(owner)) .noerror else .nxdomain);
+        const name = static orelse return r.negative(id, out, z, if (dynamic(overlay, owner)) .noerror else .nxdomain);
         const cname = name.get(.cname) orelse return r.negative(id, out, z, .noerror);
         r.answer(.{ .name = owner, .type = .cname, .ttl = cname.ttl, .rdata = cname.rdatas[0] });
         owner = cname.rdatas[0];
         // The chase ends where the zone ends or where a loop could begin; the client continues.
         if (!zone.isUnder(owner, z.origin) or hops == max_cname_hops) return r.finish(id, out, .noerror);
     }
+}
+
+/// Whether the overlay makes `name` exist: a dynamic record at or below it (ADR 0004).
+fn dynamic(overlay: ?*const update.Overlay, name: []const u8) bool {
+    return overlay != null and overlay.?.exists(name);
+}
+
+/// `name` itself when it exists, else the RRsets of `*.<closest encloser>` when that wildcard
+/// exists (RFC 4592 §3.3.1). Names the overlay makes exist are never synthesized and count as
+/// enclosers, so dynamic records get no wildcard treatment either way (ADR 0006). `name` is in `z`.
+fn lookup(z: *const zone.Zone, overlay: ?*const update.Overlay, name: []const u8) ?zone.Name {
+    if (z.lookup(name)) |n| return n;
+    if (dynamic(overlay, name)) return null;
+    // The closest encloser is the first existing ancestor; the origin always exists.
+    var ce = name;
+    while (true) {
+        ce = ce[1 + ce[0] ..];
+        if (z.lookup(ce) != null or dynamic(overlay, ce)) break;
+    }
+    var source: [255]u8 = undefined; // `ce` lost at least a 2-byte label: `*.ce` fits
+    source[0] = 1;
+    source[1] = '*';
+    @memcpy(source[2..][0..ce.len], ce);
+    return z.lookup(source[0 .. 2 + ce.len]);
 }
 
 /// The answer to a forwarded query from a validated upstream response, every TTL set to `ttl`
@@ -208,7 +232,7 @@ const Response = struct {
 const testing = std.testing;
 const config = @import("config.zig");
 
-const test_zone_head =
+pub const test_zone_head =
     \\origin = "uchi.example.org."
     \\ttl = 300
     \\serial = 1
@@ -236,15 +260,24 @@ const test_zone_head =
     \\cname = "nowhere"
     \\[names."loop"]
     \\cname = "loop"
+    \\[names."*.wild"]
+    \\a = ["10.100.0.9"]
+    \\txt = ["wild"]
+    \\[names."host.wild"]
+    \\a = ["10.100.0.10"]
+    \\[names."x.ent.wild"]
+    \\a = ["10.100.0.11"]
+    \\[names."*.alias"]
+    \\cname = "vm.kekkai"
     \\[names."big"]
     \\txt = [
     \\
 ;
 /// Eight TXT strings of 255 bytes (the first one 256, so it is split): over 2 KiB of RDATA.
-const test_zone = test_zone_head ++ "\"" ++ "y" ** 256 ++ "\",\n" ++ ("\"" ++ "x" ** 255 ++ "\",\n") ** 7 ++ "]\n";
+pub const test_zone = test_zone_head ++ "\"" ++ "y" ** 256 ++ "\",\n" ++ ("\"" ++ "x" ** 255 ++ "\",\n") ** 7 ++ "]\n";
 
 /// The public apex of ADR 0004: no `uchi` names, a CAA record.
-const apex_zone =
+pub const apex_zone =
     \\origin = "example.org."
     \\ttl = 300
     \\serial = 1
@@ -260,6 +293,8 @@ const apex_zone =
     \\caa = [{ flags = 0, tag = "issue", value = "letsencrypt.org" }]
     \\[names."ns1"]
     \\a = ["192.0.2.53"]
+    \\[names."*"]
+    \\txt = ["wild"]
 ;
 
 const Fixture = struct {
@@ -389,6 +424,43 @@ test "CNAME: in-zone targets are chased, out-of-zone and dangling ones are not" 
     const loop = try f.ask(.{ .name = "loop.uchi.example.org." });
     try expectRcode(loop, .noerror);
     try testing.expectEqual(@as(usize, max_cname_hops + 1), loop.answer.len);
+}
+
+test "wildcards (RFC 4592): synthesis, closest encloser, no match for existing names or ENTs, CNAME, NODATA" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "anything.wild.uchi.example.org.", "\x0a\x64\x00\x09" },
+        .{ "a.b.wild.uchi.example.org.", "\x0a\x64\x00\x09" }, // several labels
+        .{ "*.wild.uchi.example.org.", "\x0a\x64\x00\x09" }, // the wildcard owner itself
+        .{ "host.wild.uchi.example.org.", "\x0a\x64\x00\x0a" }, // an existing name is never synthesized
+    }) |c| {
+        const m = try f.ask(.{ .name = c[0] });
+        try expectRcode(m, .noerror);
+        try testing.expect(m.flags.aa and m.answer.len == 1 and m.authority.len == 0);
+        try testing.expectEqualSlices(u8, c[1], m.answer[0].rdata);
+        var nbuf: [255]u8 = undefined;
+        try testing.expectEqualSlices(u8, try wire.nameFromText(&nbuf, c[0]), m.answer[0].name); // the owner is the query name
+    }
+    for ([_]struct { []const u8, wire.Type, Rcode }{
+        .{ "sub.host.wild.uchi.example.org.", .a, .nxdomain }, // closest encloser host.wild has no wildcard
+        .{ "ent.wild.uchi.example.org.", .a, .noerror }, // empty non-terminal: NODATA, no synthesis
+        .{ "ghost.*.wild.uchi.example.org.", .a, .nxdomain }, // RFC 4592 §2.2.1
+        .{ "anything.wild.uchi.example.org.", .mx, .noerror }, // NODATA for a type the wildcard lacks
+        .{ "nope.uchi.example.org.", .a, .nxdomain }, // no wildcard at the apex
+    }) |c| {
+        const m = try f.ask(.{ .name = c[0], .type = c[1] });
+        try expectRcode(m, c[2]);
+        try testing.expect(m.answer.len == 0 and m.authority.len == 1 and m.authority[0].type == .soa);
+    }
+    const cname = try f.ask(.{ .name = "foo.alias.uchi.example.org." });
+    try expectRcode(cname, .noerror);
+    try testing.expectEqual(@as(usize, 2), cname.answer.len);
+    try testing.expectEqual(wire.Type.cname, cname.answer[0].type);
+    try testing.expectEqualSlices(u8, "\x03foo\x05alias\x04uchi\x07example\x03org\x00", cname.answer[0].name);
+    try testing.expectEqualSlices(u8, "\x0a\x64\x00\x03", cname.answer[1].rdata);
+    try testing.expectEqual(wire.Type.hinfo, (try f.ask(.{ .name = "anything.wild.uchi.example.org.", .type = .any })).answer[0].type);
+    try expectRcode(try f.ask(.{ .name = "sub.host.wild.uchi.example.org.", .type = .any }), .nxdomain);
 }
 
 test "REFUSED outside the zones, NOTIMP for other opcodes, ANY is HINFO" {
@@ -540,8 +612,14 @@ test "soto: BIND's signed UPDATE is applied and answered signed; the overlay is 
         try expectRcode(m, .noerror);
         try testing.expect(m.answer.len == 0 and m.authority.len == 1 and m.authority[0].type == .soa);
     }
+    // The overlay's names count as enclosers: `uchi.example.org` has no wildcard, so no synthesis from `*.example.org`.
     try expectRcode(try f.ask(.{ .name = "vm.uchi.example.org." }), .nxdomain);
     try expectRcode(try f.ask(.{ .name = challenge, .type = .a }), .noerror);
+    // A challenge name without dynamic records is an ordinary name: the static wildcard applies;
+    // one with dynamic records exists, so only those are served (no wildcard, no mixing).
+    const other = try f.ask(.{ .name = "_acme-challenge.other.example.org.", .type = .txt });
+    try testing.expect(other.answer.len == 1 and std.mem.eql(u8, other.answer[0].rdata, "\x04wild"));
+    try testing.expectEqualSlices(u8, "\x04tok1", (try f.ask(.{ .name = challenge, .type = .txt })).answer[0].rdata);
     try testing.expectEqual(wire.Type.hinfo, (try f.ask(.{ .name = challenge, .type = .any })).answer[0].type);
     // Replayed outside the fudge: BADTIME, signed, nothing applied; a bad key: unsigned NOTAUTH.
     f.soto(tsig.vector.time + 301);

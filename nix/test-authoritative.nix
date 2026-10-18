@@ -83,10 +83,13 @@ pkgs.testers.runNixOSTest {
               out = q(f"+noall +comments +authority {name} {rtype}")
               assert "status: NOERROR" in out and "ANSWER: 0" in out and re.search(r"IN\s+SOA", out), out
 
-      with subtest("REFUSED outside the loaded zones, NOTIMP for other opcodes"):
-          for args, status in [("example.net A", "REFUSED"), ("org A", "REFUSED"), ("+opcode=5 hub.kekkai.uchi.example.org A", "NOTIMP")]:
+      with subtest("REFUSED outside the loaded zones and for UPDATE in uchi mode, NOTIMP for other opcodes"):
+          # Opcode 5 (UPDATE) is REFUSED on a uchi (ADR 0006); opcode 2 (STATUS) is not implemented.
+          for args, status in [("example.net A", "REFUSED"), ("org A", "REFUSED"), ("+opcode=5 hub.kekkai.uchi.example.org A", "REFUSED"), ("+opcode=2 hub.kekkai.uchi.example.org A", "NOTIMP")]:
               out = q(f"+noall +comments {args}")
               assert f"status: {status}" in out, out
+          out = server.succeed("journalctl -u annai.service --no-pager")
+          assert "event=update-refused" in out and "reason=uchi-mode" in out, out
 
       with subtest("SRV, MX, TXT, ANY"):
           for args, expected in [("_imaps._tcp.uchi.example.org SRV", "10 0 993 mail.soto.example.org."), ("mail.uchi.example.org MX", "10 mail.soto.example.org."), ("info.uchi.example.org TXT", '"v=spf1 -all"')]:

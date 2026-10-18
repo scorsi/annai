@@ -1,0 +1,11 @@
+# Unit tests, annai check on the example configs, module checks and the nixosTests on every push, on the Linux runner.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: linux
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - run: nix flake check --print-build-logs

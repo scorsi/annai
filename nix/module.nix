@@ -95,13 +95,13 @@ in
     update.maxTtl = mkOption {
       type = types.ints.between 0 2147483647;
       default = 120;
-      description = "Cap on the TTL of a dynamic `_acme-challenge` TXT record, in seconds (ADR 0006).";
+      description = "Cap on the TTL served for a dynamic `_acme-challenge` TXT record, in seconds, so resolvers do not cache an old challenge. The default is the value fixed by ADR 0006 and deployments keep it; the option exists so tests can use short values.";
     };
 
     update.lifetime = mkOption {
       type = types.ints.between 0 2147483647;
       default = 3600;
-      description = "Seconds a dynamic record stays in memory, whatever its TTL, unless the client deletes it (ADR 0006).";
+      description = "Seconds a dynamic record stays when the client never deletes it, e.g. after a crash. The default is the value fixed by ADR 0006 and deployments keep it; the option exists so tests can use short values.";
     };
 
     zones = mkOption {

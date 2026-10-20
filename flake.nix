@@ -146,10 +146,20 @@
           module = render ./nix/example.nix { };
           module-soto = render ./nix/example-soto.nix { };
           module-metrics = render ./nix/example.nix { services.annai.metrics.listen = "[::1]:9153"; };
-          # `annai check` refuses a metrics listener off loopback, as the module's assertion does.
-          module-metrics-public = pkgs.testers.testBuildFailure (
-            render ./nix/example.nix { services.annai.metrics.listen = "0.0.0.0:9153"; }
-          );
+          # `annai check` refuses a metrics listener off loopback, as the module's assertion does,
+          # and says so in a schema v1 line (ADR 0011): a refused start writes the same to the journal.
+          module-metrics-public =
+            pkgs.runCommand "module-metrics-public"
+              {
+                failed = pkgs.testers.testBuildFailure (
+                  render ./nix/example.nix { services.annai.metrics.listen = "0.0.0.0:9153"; }
+                );
+              }
+              ''
+                grep -q '"event":"config-invalid"' $failed/testBuildFailure.log
+                ${nisshi.lib.validateLogs.${system}} validate --logs < $failed/testBuildFailure.log
+                touch $out
+              '';
           module-metrics-assertion =
             let
               assertions =

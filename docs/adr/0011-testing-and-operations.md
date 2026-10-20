@@ -59,8 +59,11 @@ key=value logs" of v0 and the metrics bullet of v1; the rest of the decision sta
 - Every string that can come from a client is written with `std.json.Stringify`; names off the
   wire are printed as `zone.fmt` does (non-printable bytes as `?`) then escaped. A line over
   2 KiB is dropped (names are at most 255 bytes, so only a bug can reach it).
-- `annai check` and a refused start keep their plain `annai: <path>: <message>` lines: they
-  are a command-line tool's diagnostics, and a unit that never started has no query to log.
+- `annai check` and a refused start write schema v1 `error` lines too (owner decision
+  2026-10-20: a refused start reaches the journal): `config-invalid`, `read-failed`,
+  `key-invalid` or `start-failed`, with `err` = `<path>: <message>` (the error name for
+  `start-failed`); only the usage line for a wrong command line, which the unit's fixed
+  `annai serve <path>` never prints, stays plain text.
 - The NixOS module sets `LogRateLimitIntervalSec=30s` and `LogRateLimitBurst=30000` as
   `mkDefault` (nisshi ADR 0009): 1000 lines/s sustained; hikyaku counts what journald drops.
   Sampling above that stays v2.

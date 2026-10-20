@@ -23,6 +23,9 @@ const config = @import("config.zig");
 const forward = @import("forward.zig");
 const tsig = @import("tsig.zig");
 const update = @import("update.zig");
+const log = @import("log.zig");
+const metrics = @import("metrics.zig");
+const build_options = @import("build_options");
 
 const max_message = 65535;
 const idle_timeout_ms = 10_000; // RFC 7766 §6.2.3: a few seconds of idle time
@@ -40,6 +43,7 @@ const PosixAddress = extern union { any: posix.sockaddr, in: posix.sockaddr.in, 
 
 const Conn = struct {
     fd: posix.fd_t,
+    peer: PosixAddress,
     /// Tells a later connection on the same slot from this one when a forwarded answer arrives.
     gen: u64,
     deadline: i64,
@@ -48,7 +52,18 @@ const Conn = struct {
     buf: [2 + max_message]u8 = undefined,
 };
 
-const Slot = union(enum) { free, udp: posix.fd_t, listener: posix.fd_t, conn: Conn };
+const Slot = union(enum) { free, udp: posix.fd_t, listener: posix.fd_t, conn: Conn, scrape: posix.fd_t };
+
+/// Who asked and when, for the `query` log line and the metrics (ADR 0011).
+const Asker = struct {
+    proto: engine.Transport,
+    client: PosixAddress,
+    /// Monotonic nanoseconds when the query was read.
+    start: i64,
+};
+
+/// Whether the answer came from the forwarding cache (`none`: local zones or nothing to forward).
+const CacheUse = enum { none, hit, miss };
 
 /// Where the answer to a query goes.
 const ReplyTo = union(enum) {
@@ -61,6 +76,7 @@ const Waiter = struct {
     query: engine.Forward,
     name: [255]u8,
     to: ReplyTo,
+    asker: Asker,
 
     fn forward(w: *const Waiter) engine.Forward {
         var f = w.query;
@@ -98,6 +114,8 @@ pub const Server = struct {
     keys: []const tsig.Key,
     overlay: update.Overlay,
     soto: bool,
+    mode: config.Mode,
+    metrics: metrics.Metrics,
     /// Poller tokens `slots.len + i`.
     pending: [max_pending]?Pending = @splat(null),
     next_gen: u64 = 0,
@@ -117,14 +135,17 @@ pub const Server = struct {
             .gpa = gpa,
             .zones = zones,
             .poller = try poll.Poller.init(),
-            .slots = try gpa.alloc(Slot, 2 * listen.len + max_conns),
+            .slots = try gpa.alloc(Slot, 2 * listen.len + 1 + max_conns),
             .arena = std.heap.ArenaAllocator.init(gpa),
             .forwarding = cfg.forwarding,
             .cache = .init(gpa, if (cfg.forwarding) |f| f.cache_bytes else 0),
             .keys = keys,
             .overlay = .init(gpa, caps.max_ttl, caps.lifetime),
             .soto = cfg.mode == .soto,
+            .mode = cfg.mode,
+            .metrics = try .init(gpa, if (cfg.forwarding) |f| f.upstreams.len else 0, keys.len),
         };
+        defer s.metrics.deinit(gpa);
         defer gpa.free(s.slots);
         defer s.arena.deinit();
         defer s.cache.deinit();
@@ -137,7 +158,13 @@ pub const Server = struct {
             const tcp = try open(addr, posix.SOCK.STREAM);
             s.slots[2 * i + 1] = .{ .listener = tcp };
             try s.poller.add(tcp, 2 * i + 1);
-            std.debug.print("level=info event=listen addr={f}\n", .{addr});
+            log.event(.info, "listen", .{ .addr = addr });
+        }
+        if (cfg.metrics) |addr| {
+            const fd = try open(addr, posix.SOCK.STREAM);
+            s.slots[2 * listen.len] = .{ .scrape = fd };
+            try s.poller.add(fd, 2 * listen.len);
+            log.event(.info, "metrics-listen", .{ .addr = addr });
         }
         var events: [64]poll.Event = undefined;
         while (true) {
@@ -154,6 +181,7 @@ pub const Server = struct {
                     .udp => |fd| s.serveUdp(fd),
                     .listener => |fd| s.accept(fd),
                     .conn => |*c| s.serveTcp(ev.token, c),
+                    .scrape => |fd| s.scrape(fd),
                     .free => {},
                 }
             }
@@ -161,33 +189,67 @@ pub const Server = struct {
             s.overlay.expire(@divTrunc(now, 1000));
             for (s.slots, 0..) |slot, i| if (slot == .conn and slot.conn.deadline <= now) s.close(i);
             for (&s.pending, 0..) |*p, i| if (p.* != null and p.*.?.deadline <= now) {
-                std.debug.print("level=warn event=upstream-timeout upstream={f}\n", .{s.forwarding.?.upstreams[p.*.?.upstream]});
+                const u = p.*.?.upstream;
+                log.event(.warn, "upstream-timeout", .{ .upstream = s.forwarding.?.upstreams[u], .qname = zone.fmt(p.*.?.qname()), .qtype = log.typeName(p.*.?.type) });
+                s.metrics.upstream(u, .timeout);
                 s.attempt(i, p.*.?.upstream + 1);
             };
         }
     }
 
-    fn respond(s: *Server, packet: []const u8, transport: engine.Transport, to: ReplyTo) ?[]const u8 {
+    fn respond(s: *Server, packet: []const u8, to: ReplyTo, a: Asker) ?[]const u8 {
         defer _ = s.arena.reset(.retain_capacity);
         var fwd: ?engine.Forward = null;
-        const ctx: engine.Context = .{ .zones = s.zones, .keys = s.keys, .overlay = if (s.soto) &s.overlay else null, .now = nowUnix(), .mono = @divTrunc(nowMs(), 1000) };
-        const n = engine.respond(s.arena.allocator(), ctx, packet, s.out[2..], transport, if (s.forwarding != null) &fwd else null) orelse
-            return if (fwd) |f| s.forwardQuery(f, to) else null;
-        return s.out[2 .. 2 + n];
+        const ctx: engine.Context = .{ .zones = s.zones, .keys = s.keys, .overlay = if (s.soto) &s.overlay else null, .now = nowUnix(), .mono = @divTrunc(nowMs(), 1000), .metrics = &s.metrics };
+        var cache: CacheUse = .none;
+        const reply = if (engine.respond(s.arena.allocator(), ctx, packet, s.out[2..], a.proto, if (s.forwarding != null) &fwd else null)) |n|
+            s.out[2 .. 2 + n]
+        else
+            (s.forwardQuery((fwd orelse return null), to, a, &cache) orelse return null);
+        s.answered(a, packet, reply, cache);
+        return reply;
+    }
+
+    /// Logs and counts one answered query; `asked` holds the question (the query, or the reply).
+    fn answered(s: *Server, a: Asker, asked: []const u8, reply: []const u8, cache: CacheUse) void {
+        var qbuf: [255]u8 = undefined;
+        const q = log.question(asked, &qbuf);
+        const flags: wire.Flags = @bitCast(std.mem.readInt(u16, reply[2..4], .big));
+        var rcode: u12 = flags.rcode;
+        // BADVERS (16) is the only extended rcode annai sends; its upper bits are in the OPT.
+        if (wire.Message.parse(s.arena.allocator(), reply)) |m| {
+            if (m.edns() catch null) |o| rcode |= @as(u12, o.ext_rcode) << 4;
+        } else |_| {}
+        const dur: u64 = @intCast(@max(0, nowNs() - a.start));
+        s.metrics.query(a.proto, if (q) |x| x.type else null, rcode, dur);
+        log.event(.info, "query", .{
+            .proto = @tagName(a.proto),
+            .client = Host{ .addr = a.client },
+            .qname = if (q) |x| zone.fmt(x.name) else null,
+            .qtype = if (q) |x| log.typeName(x.type) else null,
+            .rcode = log.rcodeName(rcode),
+            .aa = flags.aa,
+            .cache = @tagName(cache),
+            .size = reply.len,
+            .dur_us = dur / 1000,
+        });
     }
 
     /// Answers from the cache, or joins or starts the upstream query; null when the answer comes later.
-    fn forwardQuery(s: *Server, f: engine.Forward, to: ReplyTo) ?[]const u8 {
+    fn forwardQuery(s: *Server, f: engine.Forward, to: ReplyTo, a: Asker, cache: *CacheUse) ?[]const u8 {
         var lowered: [255]u8 = undefined;
         @memcpy(lowered[0..f.question.name.len], f.question.name);
         const qname = zone.lower(lowered[0..f.question.name.len]);
         var kbuf: [257]u8 = undefined;
         const now_s = @divTrunc(nowMs(), 1000);
-        if (s.cache.get(forward.key(&kbuf, qname, f.question.type), now_s)) |e| {
+        const hit = s.cache.get(forward.key(&kbuf, qname, f.question.type), now_s);
+        s.metrics.cacheLookup(hit != null);
+        cache.* = if (hit != null) .hit else .miss;
+        if (hit) |e| {
             const n = engine.forwarded(s.arena.allocator(), f, e.packet, @intCast(e.expires - now_s), s.out[2..]);
             return s.out[2 .. 2 + n];
         }
-        var waiter: Waiter = .{ .query = f, .name = undefined, .to = to };
+        var waiter: Waiter = .{ .query = f, .name = undefined, .to = to, .asker = a };
         @memcpy(waiter.name[0..f.question.name.len], f.question.name);
         for (&s.pending) |*slot| if (slot.*) |*p| if (p.type == f.question.type and std.mem.eql(u8, p.qname(), qname)) {
             if (p.waiters.items.len == max_waiters) return null; // the client retries
@@ -197,7 +259,7 @@ pub const Server = struct {
         const i = for (s.pending, 0..) |p, i| {
             if (p == null) break i;
         } else {
-            std.debug.print("level=warn event=forward-refused reason=pending-cap\n", .{});
+            log.event(.warn, "forward-refused", .{ .reason = "pending-cap" });
             const n = engine.forwarded(s.arena.allocator(), f, null, 0, s.out[2..]);
             return s.out[2 .. 2 + n];
         };
@@ -222,15 +284,19 @@ pub const Server = struct {
             p.id = randomId();
             var qbuf: [512]u8 = undefined;
             const query = upstreamQuery(p, &qbuf);
-            p.fd = connectUdp(ups[u], query) catch continue;
+            p.fd = connectUdp(ups[u], query) catch {
+                s.metrics.upstream(u, .@"error");
+                continue;
+            };
             p.deadline = nowMs() + upstream_timeout_ms;
             s.poller.add(p.fd, s.slots.len + i) catch {
                 s.closeUpstream(p);
+                s.metrics.upstream(u, .@"error");
                 continue;
             };
             return;
         }
-        std.debug.print("level=warn event=forward-failed reason=no-upstream-left\n", .{});
+        log.event(.warn, "forward-failed", .{ .reason = "no-upstream-left", .qname = zone.fmt(p.qname()), .qtype = log.typeName(p.type) });
         s.complete(i, null, 0);
     }
 
@@ -242,7 +308,8 @@ pub const Server = struct {
             .SUCCESS => {},
             .AGAIN, .INTR => return,
             else => |e| { // e.g. ECONNREFUSED from an ICMP port unreachable
-                std.debug.print("level=warn event=upstream-error upstream={f} errno={s}\n", .{ s.forwarding.?.upstreams[p.upstream], @tagName(e) });
+                log.event(.warn, "upstream-error", .{ .upstream = s.forwarding.?.upstreams[p.upstream], .qname = zone.fmt(p.qname()), .qtype = log.typeName(p.type), .err = @tagName(e) });
+                s.metrics.upstream(p.upstream, .@"error");
                 return s.attempt(i, p.upstream + 1);
             },
         }
@@ -253,15 +320,23 @@ pub const Server = struct {
             var qbuf: [2 + 512]u8 = undefined;
             const query = upstreamQuery(p, qbuf[2..]);
             std.mem.writeInt(u16, qbuf[0..2], @intCast(query.len), .big);
-            packet = tcpExchange(s.forwarding.?.upstreams[p.upstream], qbuf[0 .. 2 + query.len], &s.up) orelse return s.attempt(i, p.upstream + 1);
-            m = s.validate(p, packet) orelse return s.attempt(i, p.upstream + 1);
+            packet = tcpExchange(s.forwarding.?.upstreams[p.upstream], qbuf[0 .. 2 + query.len], &s.up) orelse return s.failed(i, .@"error");
+            m = s.validate(p, packet) orelse return s.failed(i, .@"error");
         }
-        if (m.flags.rcode != 0 and m.flags.rcode != 3) return s.attempt(i, p.upstream + 1);
+        if (m.flags.rcode != 0 and m.flags.rcode != 3) return s.failed(i, .rcode);
+        s.metrics.upstream(p.upstream, .ok);
         const f = s.forwarding.?;
         const ttl = forward.lifetime(m, f.min_ttl, f.max_ttl) orelse 0;
         var kbuf: [257]u8 = undefined;
         s.cache.put(forward.key(&kbuf, p.qname(), p.type), packet, ttl, @divTrunc(nowMs(), 1000)) catch {};
         s.complete(i, packet, ttl);
+    }
+
+    /// Counts the failure of the current upstream of pending query `i` and tries the next one.
+    fn failed(s: *Server, i: usize, result: metrics.Upstream) void {
+        const u = s.pending[i].?.upstream;
+        s.metrics.upstream(u, result);
+        s.attempt(i, u + 1);
     }
 
     /// The parsed answer if it is a response to exactly this query (RFC 5452: ID and question).
@@ -279,6 +354,7 @@ pub const Server = struct {
         s.closeUpstream(p);
         for (p.waiters.items) |*w| {
             const n = engine.forwarded(s.arena.allocator(), w.forward(), packet, ttl, s.out[2..]);
+            s.answered(w.asker, s.out[2 .. 2 + n], s.out[2 .. 2 + n], .miss);
             s.deliver(w.to, s.out[2 .. 2 + n]);
         }
         p.waiters.deinit(s.gpa);
@@ -309,31 +385,22 @@ pub const Server = struct {
         var to: ReplyTo = .{ .udp = .{ .fd = fd, .peer = undefined, .len = @sizeOf(PosixAddress) } };
         const rc = sys.recvfrom(fd, &s.in, s.in.len, 0, &to.udp.peer.any, &to.udp.len);
         if (posix.errno(rc) != .SUCCESS) return; // EAGAIN or a transient ICMP error: nothing to answer
-        const reply = s.respond(s.in[0..@intCast(rc)], .udp, to) orelse return;
+        const reply = s.respond(s.in[0..@intCast(rc)], to, .{ .proto = .udp, .client = to.udp.peer, .start = nowNs() }) orelse return;
         _ = sys.sendto(fd, reply.ptr, reply.len, 0, &to.udp.peer.any, to.udp.len);
     }
 
     fn accept(s: *Server, fd: posix.fd_t) void {
-        const rc = if (is_linux) sys.accept4(fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) else sys.accept(fd, null, null);
-        switch (posix.errno(rc)) {
-            .SUCCESS => {},
-            .AGAIN, .INTR, .CONNABORTED => return,
-            else => |e| return std.debug.print("level=warn event=accept errno={s}\n", .{@tagName(e)}),
-        }
-        const cfd: posix.fd_t = @intCast(rc);
+        var peer: PosixAddress = undefined;
+        const cfd = acceptConn(fd, &peer) orelse return;
         const slot = for (s.slots, 0..) |slot, i| {
             if (slot == .free) break i;
         } else {
-            std.debug.print("level=warn event=tcp-refused reason=connection-cap\n", .{});
-            _ = sys.close(cfd);
-            return;
-        };
-        if (!is_linux) nonblocking(cfd) catch {
+            log.event(.warn, "tcp-refused", .{ .reason = "connection-cap" });
             _ = sys.close(cfd);
             return;
         };
         s.next_gen += 1;
-        s.slots[slot] = .{ .conn = .{ .fd = cfd, .gen = s.next_gen, .deadline = nowMs() + idle_timeout_ms } };
+        s.slots[slot] = .{ .conn = .{ .fd = cfd, .peer = peer, .gen = s.next_gen, .deadline = nowMs() + idle_timeout_ms } };
         s.poller.add(cfd, slot) catch s.close(slot);
     }
 
@@ -353,7 +420,7 @@ pub const Server = struct {
             if (c.len < 2 + mlen) return;
             c.messages += 1;
             if (c.messages > max_messages_per_conn) return s.close(token);
-            if (s.respond(c.buf[2 .. 2 + mlen], .tcp, .{ .tcp = .{ .token = token, .gen = c.gen } })) |reply| {
+            if (s.respond(c.buf[2 .. 2 + mlen], .{ .tcp = .{ .token = token, .gen = c.gen } }, .{ .proto = .tcp, .client = c.peer, .start = nowNs() })) |reply| {
                 std.mem.writeInt(u16, s.out[0..2], @intCast(reply.len), .big);
                 sendAll(c.fd, s.out[0 .. 2 + reply.len]) catch return s.close(token);
             }
@@ -364,11 +431,88 @@ pub const Server = struct {
         }
     }
 
+    /// One `GET /metrics` (ADR 0011), answered on the spot and closed.
+    /// shortcut: served inline, a slow scraper blocks the loop up to 1 s; the only client is the local agent on loopback.
+    fn scrape(s: *Server, lfd: posix.fd_t) void {
+        var peer: PosixAddress = undefined;
+        const fd = acceptConn(lfd, &peer) orelse return;
+        defer _ = sys.close(fd);
+        var req: [1024]u8 = undefined;
+        var got: usize = 0;
+        const deadline = nowMs() + 1000;
+        while (std.mem.indexOf(u8, req[0..got], "\r\n\r\n") == null and got < req.len) {
+            const rc = sys.recvfrom(fd, req[got..].ptr, req.len - got, 0, null, null);
+            switch (posix.errno(rc)) {
+                .SUCCESS => if (rc == 0) break else {
+                    got += @intCast(rc);
+                },
+                .AGAIN, .INTR => if (!waitFd(fd, posix.POLL.IN, deadline)) return,
+                else => return,
+            }
+        }
+        const line = req[0 .. std.mem.indexOf(u8, req[0..got], "\r\n") orelse got];
+        const ok = std.mem.startsWith(u8, line, "GET /metrics ") or std.mem.startsWith(u8, line, "GET /metrics?");
+        var body: std.Io.Writer.Allocating = .init(s.gpa);
+        defer body.deinit();
+        if (ok) metrics.write(&s.metrics, .{
+            .version = build_options.version,
+            .mode = @tagName(s.mode),
+            .upstreams = if (s.forwarding) |f| f.upstreams else &.{},
+            .keys = s.keys,
+            .cache_entries = s.cache.map.count(),
+            .dynamic_records = s.overlay.records.items.len,
+        }, &body.writer) catch return else body.writer.writeAll("not found\n") catch return;
+        var head: [256]u8 = undefined;
+        const h = std.fmt.bufPrint(&head, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
+            if (ok) "200 OK" else "404 Not Found",
+            if (ok) metrics.content_type else "text/plain; charset=utf-8",
+            body.written().len,
+        }) catch unreachable;
+        sendAll(fd, h) catch return;
+        sendAll(fd, body.written()) catch return;
+    }
+
     fn close(s: *Server, token: usize) void {
         const fd = s.slots[token].conn.fd;
         s.poller.remove(fd);
         _ = sys.close(fd);
         s.slots[token] = .free;
+    }
+};
+
+/// An accepted connection, non-blocking and close-on-exec, its peer in `peer`; null on error.
+fn acceptConn(fd: posix.fd_t, peer: *PosixAddress) ?posix.fd_t {
+    var len: posix.socklen_t = @sizeOf(PosixAddress);
+    const rc = if (is_linux) sys.accept4(fd, &peer.any, &len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) else sys.accept(fd, &peer.any, &len);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        .AGAIN, .INTR, .CONNABORTED => return null,
+        else => |e| {
+            log.event(.warn, "accept", .{ .err = @tagName(e) });
+            return null;
+        },
+    }
+    const cfd: posix.fd_t = @intCast(rc);
+    if (!is_linux) nonblocking(cfd) catch {
+        _ = sys.close(cfd);
+        return null;
+    };
+    return cfd;
+}
+
+/// `{f}` prints the address of a peer without its port (the `client` of the query log).
+const Host = struct {
+    addr: PosixAddress,
+
+    pub fn format(h: Host, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (h.addr.any.family) {
+            posix.AF.INET => {
+                const b: [4]u8 = @bitCast(h.addr.in.addr);
+                try w.print("{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] });
+            },
+            posix.AF.INET6 => try w.print("{f}", .{net.Ip6Address.Unresolved{ .bytes = h.addr.in6.addr, .interface_name = null }}),
+            else => try w.writeAll("unknown"),
+        }
     }
 };
 
@@ -506,7 +650,7 @@ fn check(rc: anytype, what: []const u8, addr: net.IpAddress) error{Listen}!void 
     switch (posix.errno(rc)) {
         .SUCCESS => {},
         else => |e| {
-            std.debug.print("level=error event={s} addr={f} errno={s}\n", .{ what, addr, @tagName(e) });
+            log.event(.@"error", what, .{ .addr = addr, .err = @tagName(e) });
             return error.Listen;
         },
     }
@@ -520,6 +664,12 @@ fn nonblocking(fd: posix.fd_t) error{Fcntl}!void {
     const nonblock: Arg = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
     if (posix.errno(sys.fcntl(fd, posix.F.SETFL, @as(Arg, @intCast(got)) | nonblock)) != .SUCCESS) return error.Fcntl;
     if (posix.errno(sys.fcntl(fd, posix.F.SETFD, @as(Arg, posix.FD_CLOEXEC))) != .SUCCESS) return error.Fcntl;
+}
+
+fn nowNs() i64 {
+    var ts: posix.timespec = undefined;
+    _ = sys.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
 fn nowMs() i64 {

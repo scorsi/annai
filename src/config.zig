@@ -34,6 +34,8 @@ pub const Config = struct {
     forwarding: ?Forwarding = null,
     /// soto only (ADR 0006).
     update: ?Update = null,
+    /// The loopback `GET /metrics` listener (ADR 0011); null = none.
+    metrics: ?std.Io.net.IpAddress = null,
 };
 
 /// `[update]` (ADR 0006).
@@ -129,7 +131,7 @@ fn inZone(name: []const u8, origin: []const u8) bool {
 
 pub fn checkConfig(a: Allocator, text: []const u8, d: *Diag) Error!Config {
     const root = try parse(a, text, d);
-    try checkKeys(root, &.{ "mode", "listen", "zones", "forwarding", "update" }, "annai.toml", d);
+    try checkKeys(root, &.{ "mode", "listen", "zones", "forwarding", "update", "metrics" }, "annai.toml", d);
 
     const mode_name = try string(try need(root, "mode", "annai.toml", d), "mode", d);
     const mode = std.meta.stringToEnum(Mode, mode_name) orelse return d.fail("mode: \"{s}\" is not uchi or soto", .{mode_name});
@@ -190,7 +192,19 @@ pub fn checkConfig(a: Allocator, text: []const u8, d: *Diag) Error!Config {
         if (t.get("lifetime")) |x| u.lifetime = try int(u31, x, "update.lifetime", d);
         update = u;
     }
-    return .{ .mode = mode, .listen = listen.items, .zones = zones.items, .forwarding = forwarding, .update = update };
+    var metrics: ?std.Io.net.IpAddress = null;
+    if (root.get("metrics")) |v| {
+        const s = try string(v, "metrics", d);
+        const addr = std.Io.net.IpAddress.parseLiteral(s) catch return d.fail("metrics: \"{s}\" is not address:port", .{s});
+        // The local agent is the only scraper (masu's metric convention).
+        const loopback = switch (addr) {
+            .ip4 => |ip| std.mem.eql(u8, &ip.bytes, &.{ 127, 0, 0, 1 }),
+            .ip6 => |ip| std.mem.eql(u8, &ip.bytes, &(.{0} ** 15 ++ .{1})),
+        };
+        if (!loopback or addr.getPort() == 0) return d.fail("metrics: \"{s}\" is not 127.0.0.1:<port> or [::1]:<port>", .{s});
+        metrics = addr;
+    }
+    return .{ .mode = mode, .listen = listen.items, .zones = zones.items, .forwarding = forwarding, .update = update, .metrics = metrics };
 }
 
 const record_types = .{ "a", "aaaa", "cname", "ns", "ptr", "mx", "srv", "txt", "caa" };
@@ -559,4 +573,10 @@ test "annai.toml" {
     try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret_file = \"k\"", "is not absolute");
     try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret = \"c2VjcmV0\"", "unknown key \"secret\"");
     try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/a\"\n[[update.keys]]\nname = \"hanko.\"\nsecret_file = \"/b\"", "duplicate key");
+    try expectConfig(uchi ++ "metrics = \"127.0.0.1:9153\"", null);
+    try expectConfig(soto ++ "metrics = \"[::1]:9153\"", null);
+    try expectConfig(uchi ++ "metrics = \"0.0.0.0:9153\"", "is not 127.0.0.1:<port>");
+    try expectConfig(uchi ++ "metrics = \"[::]:9153\"", "is not 127.0.0.1:<port>");
+    try expectConfig(uchi ++ "metrics = \"127.0.0.1:0\"", "is not 127.0.0.1:<port>");
+    try expectConfig(uchi ++ "metrics = \"localhost:9153\"", "not address:port");
 }

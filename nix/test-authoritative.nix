@@ -1,7 +1,12 @@
 # M1 nixosTest (ADR 0011): `dig` as the oracle for the authoritative semantics of ADR 0007 over
 # UDP and TCP, IPv4 and IPv6, against the uchi zone of nix/example.nix, plus the NixOS resolver
-# client module resolving through the server with the search domains of ADR 0005.
-{ self, pkgs }:
+# client module resolving through the server with the search domains of ADR 0005, and the
+# outputs of ADR 0011: query log lines checked by nisshi, /metrics checked by masu.
+{
+  self,
+  pkgs,
+  validate,
+}:
 pkgs.testers.runNixOSTest {
   name = "annai-authoritative";
 
@@ -32,6 +37,8 @@ pkgs.testers.runNixOSTest {
         };
         # No forwarding (no Internet in the sandbox): names outside the zones stay REFUSED.
         services.annai.forwarding.upstreams = [ ];
+        services.annai.metrics.listen = "127.0.0.1:9153";
+        environment.systemPackages = [ pkgs.curl ];
         networking.firewall.allowedUDPPorts = [ 53 ];
         networking.firewall.allowedTCPPorts = [ 53 ];
       };
@@ -101,8 +108,8 @@ pkgs.testers.runNixOSTest {
           for args, status in [("example.net A", "REFUSED"), ("org A", "REFUSED"), ("+opcode=5 hub.kekkai.uchi.example.org A", "REFUSED"), ("+opcode=2 hub.kekkai.uchi.example.org A", "NOTIMP")]:
               out = q(f"+noall +comments {args}")
               assert f"status: {status}" in out, out
-          out = server.succeed("journalctl -u annai.service --no-pager")
-          assert "event=update-refused" in out and "reason=uchi-mode" in out, out
+          out = server.succeed("journalctl _SYSTEMD_UNIT=annai.service -o cat --no-pager")
+          assert '"event":"update-refused"' in out and '"reason":"uchi-mode"' in out, out
 
       with subtest("SRV, MX, TXT, ANY"):
           for args, expected in [("_imaps._tcp.uchi.example.org SRV", "10 0 993 mail.soto.example.org."), ("mail.uchi.example.org MX", "10 mail.soto.example.org."), ("info.uchi.example.org TXT", '"v=spf1 -all"')]:
@@ -143,5 +150,28 @@ pkgs.testers.runNixOSTest {
           for name, addr in [("hub", "10.100.0.1"), ("annai", "10.100.0.2")]:
               out = client.succeed(f"getent ahostsv4 {name}")
               assert addr in out, out
+
+      with subtest("logs (nisshi's schema) and metrics (masu's convention) of ADR 0011"):
+          journal = "journalctl _SYSTEMD_UNIT=annai.service -o cat --no-pager"
+          # Lowercased qname, the client's address without port, one line per query including REFUSED.
+          client4 = "${nodes.client.networking.primaryIPAddress}"
+          server.wait_until_succeeds(f"{journal} | grep -F '\"event\":\"query\",\"proto\":\"udp\",\"client\":\"{client4}\",\"qname\":\"hub.kekkai.uchi.example.org.\",\"qtype\":\"A\",\"rcode\":\"NOERROR\",\"aa\":true,\"cache\":\"none\"'")
+          out = server.succeed(journal)
+          for needle in ['"proto":"tcp"', '"qname":"example.net.","qtype":"A","rcode":"REFUSED","aa":false', '"rcode":"NOTIMP"', '"qtype":"TXT"']:
+              assert needle in out, needle
+          server.succeed(f"{journal} | ${validate.logs} validate --logs")
+          server.succeed("${validate.metrics} validate --metrics http://127.0.0.1:9153/metrics")
+
+          def counter(name):
+              out = server.succeed("curl -sf http://127.0.0.1:9153/metrics")
+              m = re.search(rf"^{re.escape(name)} (\d+)$", out, re.M)
+              assert m, f"no {name} in: {out}"
+              return int(m.group(1))
+
+          series = 'annai_queries_total{proto="udp",qtype="A",rcode="NOERROR"}'
+          before = counter(series)
+          q("+short hub.kekkai.uchi.example.org A")
+          assert counter(series) >= before + 1
+          assert counter('annai_updates_total{key="none",result="refused"}') >= 1
     '';
 }

@@ -141,6 +141,13 @@ in
       '';
     };
 
+    metrics.listen = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "127.0.0.1:9153";
+      description = "`127.0.0.1:<port>` or `[::1]:<port>` of the Prometheus `GET /metrics` listener (ADR 0011); `null` = no listener. Loopback only: the local agent is the only scraper.";
+    };
+
     configFile = mkOption {
       type = types.package;
       readOnly = true;
@@ -154,6 +161,15 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion =
+          cfg.metrics.listen == null
+          || builtins.match "(127\\.0\\.0\\.1|\\[::1])(:[0-9]+)" cfg.metrics.listen != null;
+        message = "services.annai.metrics.listen must be 127.0.0.1:<port> or [::1]:<port>, got ${toString cfg.metrics.listen}";
+      }
+    ];
+
     environment.etc."annai/annai.toml".source = cfg.configFile;
 
     systemd.services.annai = {
@@ -201,6 +217,9 @@ in
           "~@resources"
         ];
         UMask = "0077";
+        # One line per query (nisshi ADR 0009): 1000 lines/s sustained before journald drops.
+        LogRateLimitIntervalSec = lib.mkDefault "30s";
+        LogRateLimitBurst = lib.mkDefault 30000;
       };
     };
   };

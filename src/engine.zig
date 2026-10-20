@@ -9,6 +9,8 @@ const wire = @import("wire.zig");
 const zone = @import("zone.zig");
 const tsig = @import("tsig.zig");
 const update = @import("update.zig");
+const log = @import("log.zig");
+const metrics = @import("metrics.zig");
 
 pub const Rcode = wire.Rcode;
 
@@ -30,6 +32,8 @@ pub const Context = struct {
     /// Wall-clock seconds (TSIG) and monotonic seconds (overlay lifetimes).
     now: i64 = 0,
     mono: i64 = 0,
+    /// Where UPDATE results are counted (ADR 0011); null in unit tests.
+    metrics: ?*metrics.Metrics = null,
 };
 
 /// A query for a name outside the local zones, for the caller to forward (uchi mode, ADR 0008).
@@ -79,10 +83,16 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
     // error in the response (unsigned for BADKEY and BADSIG, signed for BADTIME, RFC 8945 §5.2).
     r.tsig = tsig.verify(ctx.keys, query, msg, ctx.now) catch return r.finish(id, out, .formerr);
     if (r.tsig) |t| if (t.err != .none) {
-        std.debug.print("level=warn event=tsig code={s} key={f}\n", .{ @tagName(t.err), zone.fmt(t.name) });
+        log.event(.warn, "tsig", .{ .code = @tagName(t.err), .key = zone.fmt(t.name) });
+        if (qflags.opcode == 5) if (ctx.metrics) |m| m.update(ctx.keys, null, .notauth);
         return r.finish(id, out, .notauth);
     };
-    if (qflags.opcode == 5) return r.finish(id, out, update.apply(ctx.overlay, ctx.zones, msg, if (r.tsig) |t| t.key.?.name else null, ctx.mono));
+    if (qflags.opcode == 5) {
+        const key = if (r.tsig) |t| t.key.?.name else null;
+        const rc = update.apply(ctx.overlay, ctx.zones, msg, key, ctx.mono);
+        if (ctx.metrics) |m| m.update(ctx.keys, key, rc);
+        return r.finish(id, out, rc);
+    }
     if (qflags.opcode != 0) return r.finish(id, out, .notimp);
     if (q.class != .in) return r.finish(id, out, .refused);
 

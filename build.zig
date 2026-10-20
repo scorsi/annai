@@ -6,6 +6,10 @@ pub fn build(b: *std.Build) void {
 
     const imports: []const std.Build.Module.Import = &.{.{ .name = "microwave", .module = b.dependency("microwave", .{}).module("microwave") }};
     const root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .imports = imports });
+    // annai_build_info (ADR 0011): the version of build.zig.zon.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    root.addOptions("build_options", options);
 
     b.installArtifact(b.addExecutable(.{ .name = "annai", .root_module = root }));
 

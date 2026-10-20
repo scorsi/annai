@@ -2,8 +2,13 @@
 # client VM, with `dig` as the oracle. The uchi's first upstream is the client, which never
 # answers on port 53: every cache miss exercises the failover of ADR 0008. Covers RA/AA,
 # max-ttl clamp, cache hits, negative caching, TCP fallback on TC, SERVFAIL when no upstream
-# answers, the reverse zones of ADR 0005, and the resolver module sending every name to annai.
-{ self, pkgs }:
+# answers, the reverse zones of ADR 0005, the resolver module sending every name to annai, and
+# the outputs of ADR 0011 on both servers: query log lines checked by nisshi, /metrics by masu.
+{
+  self,
+  pkgs,
+  validate,
+}:
 pkgs.testers.runNixOSTest {
   name = "annai-forwarding";
 
@@ -54,6 +59,8 @@ pkgs.testers.runNixOSTest {
           ];
           maxTtl = 120;
         };
+        services.annai.metrics.listen = "[::1]:9153";
+        environment.systemPackages = [ pkgs.curl ];
         networking.firewall.allowedUDPPorts = [ 53 ];
         networking.firewall.allowedTCPPorts = [ 53 ];
       };
@@ -151,5 +158,35 @@ pkgs.testers.runNixOSTest {
           for name, addr in [("ns1.example.net", "192.0.2.53"), ("hub", "10.100.0.1")]:
               out = client.succeed(f"getent ahostsv4 {name}")
               assert addr in out, out
+
+      with subtest("logs (nisshi's schema) and metrics (masu's convention) of ADR 0011"):
+          journal = "journalctl _SYSTEMD_UNIT=annai.service -o cat --no-pager"
+          client4 = "${nodes.client.networking.primaryIPAddress}"
+          soto6 = "${nodes.soto.networking.primaryIPv6Address}"
+          uchi6 = "${nodes.uchi.networking.primaryIPv6Address}"
+          out = uchi.succeed(journal)
+          www = '"client":"' + client4 + '","qname":"www.example.net.","qtype":"A","rcode":"NOERROR","aa":false,"cache":'
+          for needle in [www + '"miss"', www + '"hit"', '"qname":"other.example.net.","qtype":"A","rcode":"SERVFAIL"', '"event":"upstream-timeout","upstream":"' + client4 + ':53","qname":"www.example.net.","qtype":"A"', '"proto":"tcp"', '"cache":"none"']:
+              assert needle in out, needle
+          # The soto saw the uchi's forwarded queries, from its IPv6 address, lowercased.
+          out = soto.succeed(journal)
+          assert '"client":"' + uchi6 + '","qname":"www.example.net.","qtype":"A","rcode":"NOERROR","aa":true,"cache":"none"' in out, out
+          for m in [soto, uchi]:
+              m.succeed(f"{journal} | ${validate.logs} validate --logs")
+          uchi.succeed("${validate.metrics} validate --metrics 'http://[::1]:9153/metrics'")
+
+          def counter(name):
+              out = uchi.succeed("curl -sfg 'http://[::1]:9153/metrics'")
+              m = re.search(rf"^{re.escape(name)} (\d+)$", out, re.M)
+              assert m, f"no {name} in: {out}"
+              return int(m.group(1))
+
+          assert counter('annai_cache_lookups_total{result="hit"}') >= 1
+          assert counter('annai_upstream_queries_total{upstream="' + client4 + ':53",result="timeout"}') >= 1
+          assert counter('annai_upstream_queries_total{upstream="[' + soto6 + ']:53",result="ok"}') >= 1
+          series = 'annai_queries_total{proto="udp",qtype="A",rcode="NOERROR"}'
+          before = counter(series)
+          q("+short hub.kekkai.uchi.example.org A")
+          assert counter(series) >= before + 1
     '';
 }

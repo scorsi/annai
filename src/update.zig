@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const wire = @import("wire.zig");
 const zone = @import("zone.zig");
+const log = @import("log.zig");
 const Allocator = std.mem.Allocator;
 const Rcode = wire.Rcode;
 
@@ -143,21 +144,24 @@ pub fn apply(overlay: ?*Overlay, zones: []const zone.Zone, m: wire.Message, key:
         const owner = lowerInto(&nbuf, u.name);
         switch (u.class) {
             .in => o.add(owner, u.rdata, u.ttl, now) catch |e| {
-                std.debug.print("level=warn event=update-failed key={f} owner={f} reason={s}\n", .{ zone.fmt(k), zone.fmt(owner), @errorName(e) });
+                log.event(.warn, "update-failed", .{ .key = zone.fmt(k), .owner = zone.fmt(owner), .reason = @errorName(e) });
                 return .servfail;
             },
             .any => o.remove(owner, null),
             .none => o.remove(owner, u.rdata),
             else => unreachable, // prescan
         }
-        // The count-cap test would otherwise flood the build runner's stderr.
-        if (!builtin.is_test) std.debug.print("level=info event=update key={f} owner={f} op={s} records={d}\n", .{ zone.fmt(k), zone.fmt(owner), @tagName(u.class), o.records.items.len });
+        log.event(.info, "update", .{ .key = zone.fmt(k), .owner = zone.fmt(owner), .op = switch (u.class) {
+            .in => "add",
+            .any => "delete-rrset",
+            else => "delete",
+        }, .records = o.records.items.len });
     }
     return .noerror;
 }
 
 fn refused(key: ?[]const u8, reason: []const u8, owner: ?[]const u8) Rcode {
-    std.debug.print("level=warn event=update-refused key={f} owner={f} reason={s}\n", .{ zone.fmt(key orelse "\x04none\x00"), zone.fmt(owner orelse "\x00"), reason });
+    log.event(.warn, "update-refused", .{ .key = zone.fmt(key orelse "\x04none\x00"), .owner = zone.fmt(owner orelse "\x00"), .reason = reason });
     return .refused;
 }
 

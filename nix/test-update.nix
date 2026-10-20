@@ -3,7 +3,11 @@
 # ADR 0002 (RD ignored, RA=0, REFUSED outside the zones), CAA, RFC 2136 UPDATE under the ADR 0006
 # policy (add RR, delete RR, delete RRset, TTL cap, empty non-terminals of ADR 0004, expiry), TSIG
 # (signed answers, BADSIG, BADKEY, BADTIME), and the secret file handed over by LoadCredential.
-{ self, pkgs }:
+{
+  self,
+  pkgs,
+  validate,
+}:
 let
   secret = "c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3JldC0xMjM0";
 in
@@ -23,6 +27,8 @@ pkgs.testers.runNixOSTest {
         text = "hanko:${secret}\n";
         mode = "0400";
       };
+      services.annai.metrics.listen = "127.0.0.1:9153";
+      environment.systemPackages = [ pkgs.curl ];
       networking.firewall.allowedUDPPorts = [ 53 ];
       networking.firewall.allowedTCPPorts = [ 53 ];
     };
@@ -116,8 +122,8 @@ pkgs.testers.runNixOSTest {
           assert "NOTAUTH" in out, out
           out = q(f"+noall +comments {challenge} TXT")
           assert "status: NXDOMAIN" in out, out
-          journal = soto.succeed("journalctl -u annai.service --no-pager")
-          for needle in ["reason=policy", "reason=unsigned", "code=badsig", "code=badkey", "code=badtime"]:
+          journal = soto.succeed("journalctl _SYSTEMD_UNIT=annai.service -o cat --no-pager")
+          for needle in ['"reason":"policy"', '"reason":"unsigned"', '"code":"badsig"', '"code":"badkey"', '"code":"badtime"']:
               assert needle in journal, journal
 
       with subtest("a dynamic record expires after the configured lifetime"):
@@ -128,5 +134,17 @@ pkgs.testers.runNixOSTest {
           client.sleep(20)
           out = q(f"+noall +comments {challenge} TXT")
           assert "status: NXDOMAIN" in out, out
+
+      with subtest("logs (nisshi's schema) and metrics (masu's convention) of ADR 0011"):
+          journal = "journalctl _SYSTEMD_UNIT=annai.service -o cat --no-pager"
+          out = soto.succeed(journal)
+          for needle in ['"event":"update","key":"hanko.","owner":"_acme-challenge.git.uchi.example.org.","op":"add"', '"qname":"example.org.","qtype":"SOA","rcode":"REFUSED"', '"rcode":"NOTAUTH"']:
+              assert needle in out, needle
+          soto.succeed(f"{journal} | ${validate.logs} validate --logs")
+          soto.succeed("${validate.metrics} validate --metrics http://127.0.0.1:9153/metrics")
+          out = soto.succeed("curl -sf http://127.0.0.1:9153/metrics")
+          for series, least in [('annai_updates_total{key="hanko",result="ok"}', 5), ('annai_updates_total{key="hanko",result="refused"}', 3), ('annai_updates_total{key="none",result="refused"}', 1), ('annai_updates_total{key="none",result="notauth"}', 2), ('annai_updates_total{key="hanko",result="notauth"}', 0)]:
+              m = re.search(rf"^{re.escape(series)} (\d+)$", out, re.M)
+              assert m and int(m.group(1)) >= least, f"{series} below {least} in: {out}"
     '';
 }

@@ -19,7 +19,7 @@ fn check(rc: anytype) Error!void {
     switch (posix.errno(rc)) {
         .SUCCESS => {},
         else => |e| {
-            std.debug.print("level=error event=poller errno={s}\n", .{@tagName(e)});
+            @import("log.zig").event(.@"error", "poller", .{ .err = @tagName(e) });
             return error.Unexpected;
         },
     }

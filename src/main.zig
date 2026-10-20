@@ -101,6 +101,8 @@ test {
     _ = tsig;
     _ = @import("update.zig");
     _ = @import("fuzz.zig");
+    _ = @import("log.zig");
+    _ = @import("metrics.zig");
 }
 
 test "key files: bare base64 or hanko's name:base64, same key only" {

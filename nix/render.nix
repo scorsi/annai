@@ -30,6 +30,7 @@ let
         cache_bytes = cfg.forwarding.cacheBytes;
       };
     }
+    // lib.optionalAttrs (cfg.metrics.listen != null) { metrics = cfg.metrics.listen; }
     // lib.optionalAttrs (cfg.update.keys != { }) {
       update = {
         # The path LoadCredential gives the unit (nix/module.nix), not the secret's own path.

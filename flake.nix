@@ -7,6 +7,15 @@
       url = "github:Cloudef/zig2nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Test only (ADR 0011): the log and metric validators the nixosTests run on annai's output.
+    nisshi = {
+      url = "github:scorsi/nisshi";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    masu = {
+      url = "github:scorsi/masu";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -14,6 +23,8 @@
       self,
       nixpkgs,
       zig2nix,
+      nisshi,
+      masu,
       ...
     }:
     let
@@ -134,6 +145,27 @@
           default = self.packages.${system}.default;
           module = render ./nix/example.nix { };
           module-soto = render ./nix/example-soto.nix { };
+          module-metrics = render ./nix/example.nix { services.annai.metrics.listen = "[::1]:9153"; };
+          # `annai check` refuses a metrics listener off loopback, as the module's assertion does.
+          module-metrics-public = pkgs.testers.testBuildFailure (
+            render ./nix/example.nix { services.annai.metrics.listen = "0.0.0.0:9153"; }
+          );
+          module-metrics-assertion =
+            let
+              assertions =
+                (lib.nixosSystem {
+                  modules = [
+                    self.nixosModules.default
+                    ./nix/example.nix
+                    {
+                      services.annai.metrics.listen = "192.0.2.1:9153";
+                      nixpkgs.hostPlatform = lib.replaceStrings [ "darwin" ] [ "linux" ] system;
+                    }
+                  ];
+                }).config.assertions;
+            in
+            assert lib.any (a: !a.assertion) assertions;
+            pkgs.writeText "module-metrics-assertion" "a non-loopback metrics listener fails the assertion";
           module-mode-mismatch = pkgs.testers.testBuildFailure (
             render ./nix/example.nix {
               services.annai.mode = lib.mkForce "soto";
@@ -142,11 +174,20 @@
           );
         }
         # The integration tests of ADR 0011 (VMs: Linux only).
-        // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
-          authoritative = import ./nix/test-authoritative.nix { inherit self pkgs; };
-          forwarding = import ./nix/test-forwarding.nix { inherit self pkgs; };
-          update = import ./nix/test-update.nix { inherit self pkgs; };
-        }
+        // lib.optionalAttrs (lib.hasSuffix "-linux" system) (
+          let
+            # nisshi's and masu's validators (ADR 0011): every test checks annai's real output.
+            validate = {
+              logs = nisshi.lib.validateLogs.${system};
+              metrics = masu.lib.validateMetrics.${system};
+            };
+          in
+          {
+            authoritative = import ./nix/test-authoritative.nix { inherit self pkgs validate; };
+            forwarding = import ./nix/test-forwarding.nix { inherit self pkgs validate; };
+            update = import ./nix/test-update.nix { inherit self pkgs validate; };
+          }
+        )
       );
 
       devShells = forAllSystems (system: {

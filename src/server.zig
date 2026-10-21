@@ -259,7 +259,7 @@ pub const Server = struct {
         const q = log.question(asked, &qbuf);
         const flags: wire.Flags = @bitCast(std.mem.readInt(u16, reply[2..4], .big));
         var rcode: u12 = flags.rcode;
-        // BADVERS (16) is the only extended rcode annai sends; its upper bits are in the OPT.
+        // Extended rcodes live in the OPT, including errors preserved from upstreams.
         if (wire.Message.parse(s.arena.allocator(), reply)) |m| {
             if (m.edns() catch null) |o| rcode |= @as(u12, o.ext_rcode) << 4;
         } else |_| {}
@@ -289,7 +289,7 @@ pub const Server = struct {
         s.metrics.cacheLookup(hit != null);
         cache.* = if (hit != null) .hit else .miss;
         if (hit) |e| {
-            const n = engine.forwarded(s.arena.allocator(), f, e.packet, @intCast(e.expires - now_s), s.out[2..]);
+            const n = engine.forwarded(s.arena.allocator(), f, e.packet, @intCast(now_s - e.inserted), s.out[2..]);
             return s.out[2 .. 2 + n];
         }
         var waiter: Waiter = .{ .query = f, .name = undefined, .to = to, .asker = a };
@@ -324,7 +324,10 @@ pub const Server = struct {
         const ups = s.forwarding.?.upstreams;
         for (from..ups.len) |u| {
             p.upstream = u;
-            p.id = randomId();
+            p.id = randomId(if (is_linux) linuxRandom else null) catch {
+                s.metrics.upstream(u, .@"error");
+                continue;
+            };
             var qbuf: [512]u8 = undefined;
             const query = upstreamQuery(p, &qbuf);
             p.fd = connectUdp(ups[u], query) catch {
@@ -340,7 +343,7 @@ pub const Server = struct {
             return;
         }
         log.event(.warn, "forward-failed", .{ .reason = "no-upstream-left", .qname = zone.fmt(p.qname()), .qtype = log.typeName(p.type) });
-        s.complete(i, null, 0);
+        s.complete(i, null);
     }
 
     /// An upstream answer (or error) for pending query `i`.
@@ -365,14 +368,17 @@ pub const Server = struct {
             std.mem.writeInt(u16, qbuf[0..2], @intCast(query.len), .big);
             packet = tcpExchange(s.forwarding.?.upstreams[p.upstream], qbuf[0 .. 2 + query.len], &s.up) orelse return s.failed(i, .@"error");
             m = s.validate(p, packet) orelse return s.failed(i, .@"error");
+            if (m.flags.tc) return s.failed(i, .@"error");
         }
-        if (m.flags.rcode != 0 and m.flags.rcode != 3) return s.failed(i, .rcode);
+        const opt = m.edns() catch return s.failed(i, .@"error");
+        const extended = if (opt) |o| o.ext_rcode != 0 else false;
+        if (!extended and m.flags.rcode != 0 and m.flags.rcode != 3) return s.failed(i, .rcode);
         s.metrics.upstream(p.upstream, .ok);
         const f = s.forwarding.?;
-        const ttl = forward.lifetime(m, f.min_ttl, f.max_ttl) orelse 0;
+        const ttl = forward.lifetime(m, f.max_ttl) orelse 0;
         var kbuf: [257]u8 = undefined;
         s.cache.put(forward.key(&kbuf, p.qname(), p.type), packet, ttl, @divTrunc(nowMs(), 1000)) catch {};
-        s.complete(i, packet, ttl);
+        s.complete(i, packet);
     }
 
     /// Counts the failure of the current upstream of pending query `i` and tries the next one.
@@ -388,20 +394,22 @@ pub const Server = struct {
         if (!m.flags.qr or m.id != p.id or m.flags.opcode != 0 or m.question.len != 1) return null;
         const q = m.question[0];
         if (q.type != p.type or q.class != .in or !std.ascii.eqlIgnoreCase(q.name, p.qname())) return null;
+        _ = m.edns() catch return null;
         return m;
     }
 
     /// Answers every waiter of pending query `i` (`packet` null = SERVFAIL) and frees it.
-    fn complete(s: *Server, i: usize, packet: ?[]const u8, ttl: u32) void {
+    fn complete(s: *Server, i: usize, packet: ?[]const u8) void {
         const p = &s.pending[i].?;
         s.closeUpstream(p);
         var waiters = p.waiters;
         defer waiters.deinit(s.gpa);
         s.pending[i] = null;
         for (waiters.items) |*w| {
-            const n = engine.forwarded(s.arena.allocator(), w.forward(), packet, ttl, s.out[2..]);
+            const n = engine.forwarded(s.arena.allocator(), w.forward(), packet, 0, s.out[2..]);
             s.answered(w.asker, s.out[2 .. 2 + n], s.out[2 .. 2 + n], .miss);
             s.deliver(w.to, s.out[2 .. 2 + n]);
+            _ = s.arena.reset(.retain_capacity);
         }
         // A client that already sent its EOF may now be owed nothing more.
         for (waiters.items) |w| if (w.to == .tcp) if (s.conn(w.to.tcp.token, w.to.tcp.gen)) |c| if (c.eof) s.settle(w.to.tcp.token);
@@ -752,10 +760,31 @@ fn waitFd(fd: posix.fd_t, events: i16, deadline: i64) bool {
 }
 
 /// RFC 5452 §4: unpredictable query IDs.
-fn randomId() u16 {
+fn randomId(comptime read: ?*const fn ([]u8) error{ Interrupted, Entropy }!usize) error{Entropy}!u16 {
     var b: [2]u8 = undefined;
-    if (is_linux) _ = std.os.linux.getrandom(&b, b.len, 0) else std.c.arc4random_buf(&b, b.len);
+    if (read) |get| try fillRandom(&b, get) else std.c.arc4random_buf(&b, b.len);
     return std.mem.readInt(u16, &b, .little);
+}
+
+fn linuxRandom(buf: []u8) error{ Interrupted, Entropy }!usize {
+    const rc = std.os.linux.getrandom(buf.ptr, buf.len, 0);
+    return switch (std.os.linux.errno(rc)) {
+        .SUCCESS => rc,
+        .INTR => error.Interrupted,
+        else => error.Entropy,
+    };
+}
+
+fn fillRandom(buf: []u8, read: *const fn ([]u8) error{ Interrupted, Entropy }!usize) error{Entropy}!void {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = read(buf[filled..]) catch |e| switch (e) {
+            error.Interrupted => continue,
+            error.Entropy => return error.Entropy,
+        };
+        if (n == 0 or n > buf.len - filled) return error.Entropy;
+        filled += n;
+    }
 }
 
 fn check(rc: anytype, what: []const u8, addr: net.IpAddress) error{Listen}!void {
@@ -844,7 +873,7 @@ pub const Loopback = struct {
         var d: config.Diag = .{};
         l.zones[0] = try config.loadZone(a, huge_zone, &d);
         const any = try net.IpAddress.parse("127.0.0.1", 0);
-        const fwd: ?config.Forwarding = if (opts.forwarding) |f| .{ .upstreams = try a.dupe(net.IpAddress, f.upstreams), .min_ttl = f.min_ttl, .max_ttl = f.max_ttl, .cache_bytes = f.cache_bytes } else null;
+        const fwd: ?config.Forwarding = if (opts.forwarding) |f| .{ .upstreams = try a.dupe(net.IpAddress, f.upstreams), .max_ttl = f.max_ttl, .cache_bytes = f.cache_bytes } else null;
         l.server = try Server.init(gpa, &l.zones, .{ .mode = .uchi, .listen = &.{any}, .zones = &.{}, .forwarding = fwd, .metrics = if (opts.metrics) any else null }, &.{});
         l.addr = try net.IpAddress.parse("127.0.0.1", localPort(l.server.slots[1].listener));
         l.udp_addr = try net.IpAddress.parse("127.0.0.1", localPort(l.server.slots[0].udp));
@@ -1142,5 +1171,285 @@ test "TCP framing and connection state under random streams split at random poin
         var len: usize = 0;
         for (0..count) |i| len += queryFrame(buf[len..], @intCast(i), "hub.kekkai.uchi.example.org.", .a).len;
         try l.checkStream(buf[0..len], r);
+    }
+}
+
+test "review A14: entropy retries interruptions and short reads, fails closed" {
+    const Reader = struct {
+        var calls: usize = 0;
+        fn short(buf: []u8) error{ Interrupted, Entropy }!usize {
+            calls += 1;
+            if (calls == 1) return error.Interrupted;
+            buf[0] = @intCast(calls);
+            return 1;
+        }
+        fn failed(_: []u8) error{ Interrupted, Entropy }!usize {
+            return error.Entropy;
+        }
+        fn partial(buf: []u8) error{ Interrupted, Entropy }!usize {
+            calls += 1;
+            if (calls != 1) return error.Entropy;
+            buf[0] = 42;
+            return 1;
+        }
+        fn empty(_: []u8) error{ Interrupted, Entropy }!usize {
+            return 0;
+        }
+    };
+    Reader.calls = 0;
+    try testing.expectEqual(@as(u16, 0x0302), try randomId(Reader.short));
+    try testing.expectError(error.Entropy, randomId(Reader.failed));
+    try testing.expectError(error.Entropy, randomId(Reader.empty));
+    Reader.calls = 0;
+    try testing.expectError(error.Entropy, randomId(Reader.partial));
+}
+
+/// Fake upstream used by the forward fuzzer and its deterministic regressions. Both UDP and
+/// TCP responses go through Server's sockets, validation, completion and cache-hit path.
+pub const ForwardProbe = struct {
+    l: *Loopback,
+    udp: posix.fd_t,
+    tcp: posix.fd_t,
+    client: posix.fd_t,
+    rogue: posix.fd_t,
+
+    pub const Case = enum { arbitrary, matching, wrong_id, wrong_question, tc_twice, tcp_answer, mixed_ttls, cname_nodata, badvers, short_tcp, legacy, wrong_source };
+
+    pub fn init(gpa: std.mem.Allocator) !ForwardProbe {
+        const any = try net.IpAddress.parse("127.0.0.1", 0);
+        const udp = try open(any, posix.SOCK.DGRAM);
+        errdefer _ = sys.close(udp);
+        const addr = try net.IpAddress.parse("127.0.0.1", localPort(udp));
+        const tcp = try open(addr, posix.SOCK.STREAM);
+        errdefer _ = sys.close(tcp);
+        const l = try Loopback.init(gpa, .{ .forwarding = .{ .upstreams = &.{addr} } });
+        errdefer l.deinit();
+        const client = try connectUdp(l.udp_addr, "");
+        errdefer _ = sys.close(client);
+        const receive_bytes = std.mem.toBytes(@as(c_int, 256 * 1024));
+        try posix.setsockopt(client, posix.SOL.SOCKET, posix.SO.RCVBUF, &receive_bytes);
+        const rogue = try open(any, posix.SOCK.DGRAM);
+        return .{ .l = l, .udp = udp, .tcp = tcp, .client = client, .rogue = rogue };
+    }
+
+    pub fn deinit(p: *ForwardProbe) void {
+        for ([_]posix.fd_t{ p.udp, p.tcp, p.client, p.rogue }) |fd| _ = sys.close(fd);
+        p.l.deinit();
+    }
+
+    /// Bounded memory includes the server's per-request arena, including all coalesced waiters.
+    pub fn run(p: *ForwardProbe, a: std.mem.Allocator, input: []const u8, case: Case, count: usize) !void {
+        const s = p.l.server;
+        s.cache.deinit();
+        s.cache = .init(s.gpa, 1 << 20);
+        s.arena.deinit();
+        s.arena = .init(a);
+        defer {
+            s.arena.deinit();
+            s.arena = .init(s.gpa);
+        }
+        const name = "\x03www\x07example\x03net\x00";
+        const alias = "\x02ns\x07example\x03net\x00";
+        const question: wire.Question = .{ .name = "\x03WWW\x07EXAMPLE\x03NET\x00", .type = .a };
+        var buf: [65535]u8 = undefined;
+        for (0..count) |id| {
+            const query: wire.Message = .{ .id = @intCast(id), .flags = .{ .rd = true }, .question = &.{question}, .additional = &.{(wire.Opt{ .payload = 1232 }).toRR()} };
+            const n = try query.encode(&buf);
+            try probeSend(p.client, buf[0..n], null, 0);
+            try s.step(0);
+        }
+        var peer: PosixAddress = undefined;
+        var peer_len: posix.socklen_t = @sizeOf(PosixAddress);
+        const n = try p.receive(p.udp, &buf, &peer, &peer_len);
+        const asked = try wire.Message.parse(a, buf[0..n]);
+        const good: wire.Message = .{ .id = asked.id, .flags = .{ .qr = true }, .question = asked.question, .answer = &.{.{ .name = name, .type = .a, .ttl = 300, .rdata = "1234" }} };
+        var response = good;
+        switch (case) {
+            .arbitrary => {},
+            .matching => {
+                response = wire.Message.parse(a, input) catch good;
+                response.id = asked.id;
+                response.flags.qr = true;
+                response.flags.opcode = 0;
+                response.question = asked.question;
+            },
+            .wrong_id => response.id +%= 1,
+            .wrong_question => response.question = &.{.{ .name = alias, .type = .a }},
+            .tc_twice, .tcp_answer, .short_tcp => response.flags.tc = true,
+            .mixed_ttls => {
+                response.answer = &.{ .{ .name = name, .type = .cname, .ttl = 300, .rdata = alias }, .{ .name = alias, .type = .a, .ttl = 30, .rdata = "1234" } };
+                response.additional = &.{.{ .name = alias, .type = .a, .ttl = 5, .rdata = "5678" }};
+            },
+            .cname_nodata => {
+                response.answer = &.{.{ .name = name, .type = .cname, .ttl = 300, .rdata = alias }};
+                response.authority = &.{.{ .name = "\x00", .type = .soa, .ttl = 3600, .rdata = "\x00\x00" ++ "\x00" ** 19 ++ "\x1e" }};
+            },
+            .badvers => {
+                response.answer = &.{};
+                response.additional = &.{(wire.Opt{ .payload = 1232, .ext_rcode = 1 }).toRR()};
+            },
+            .legacy => response.answer = &.{ .{ .name = name, .type = .ns, .ttl = 300, .rdata = alias }, .{ .name = name, .type = @enumFromInt(17), .ttl = 30, .rdata = alias ++ alias } },
+            .wrong_source => {},
+        }
+        var packet: []const u8 = try a.dupe(u8, if (case == .arbitrary) input[0..@min(input.len, 65507)] else buf[0 .. response.encode(&buf) catch try good.encode(&buf)]);
+        if (case == .legacy) {
+            var w = try wire.Writer.init(&buf, asked.id, .{ .qr = true });
+            try w.question(asked.question[0]);
+            const ns_at = w.len;
+            try w.rr(.answer, .{ .name = name, .type = .ns, .ttl = 300, .rdata = alias });
+            var raw: [4]u8 = undefined;
+            const pointer = 0xc000 | @as(u16, @intCast(ns_at + 12));
+            std.mem.writeInt(u16, raw[0..2], pointer, .big);
+            std.mem.writeInt(u16, raw[2..4], pointer, .big);
+            const at = w.len;
+            try w.rr(.answer, .{ .name = name, .type = @enumFromInt(65000), .ttl = 30, .rdata = &raw });
+            std.mem.writeInt(u16, buf[at + 2 ..][0..2], 17, .big);
+            packet = try a.dupe(u8, buf[0..w.len]);
+        }
+        packet = packet[0..@min(packet.len, 65507)];
+        // The oracle evaluates the actual bytes, including malformed EDNS and unmatched questions.
+        var upstream = wire.Message.parse(a, packet) catch null;
+        const valid = if (upstream) |m| blk: {
+            _ = m.edns() catch break :blk false;
+            break :blk m.id == asked.id and m.flags.qr and m.flags.opcode == 0 and m.question.len == 1 and
+                m.question[0].class == .in and m.question[0].type == .a and std.ascii.eqlIgnoreCase(m.question[0].name, name);
+        } else false;
+        const retry = valid and upstream.?.flags.tc;
+        var tcp_reply: [65537]u8 = undefined;
+        var worker: ?std.Thread = null;
+        if (retry) {
+            // shortcut: pace TCP retries below TIME_WAIT port exhaustion, like the tcp target.
+            _ = posix.poll(&.{}, 3) catch {};
+            // Short TCP frames must fail rather than accepting the parseable UDP packet.
+            std.mem.writeInt(u16, tcp_reply[0..2], @intCast(packet.len), .big);
+            @memcpy(tcp_reply[2..][0..packet.len], packet);
+            var len = packet.len + 2;
+            if (case == .tcp_answer) {
+                var full = upstream.?;
+                full.flags.tc = false;
+                const size = try full.encode(tcp_reply[2..]);
+                std.mem.writeInt(u16, tcp_reply[0..2], @intCast(size), .big);
+                len = size + 2;
+                upstream = try wire.Message.parse(a, try a.dupe(u8, tcp_reply[2..len]));
+            }
+            if (case == .short_tcp) len = 3;
+            worker = try std.Thread.spawn(.{}, probeTcp, .{ p.tcp, tcp_reply[0..len] });
+        }
+        defer if (worker) |thread| thread.join();
+        if (case == .wrong_source) {
+            try probeSend(p.rogue, packet, &peer, peer_len);
+            for (0..8) |_| try s.step(0);
+            if (try probeAvailable(p.client, &buf)) return error.UnmatchedResponse;
+        }
+        try probeSend(p.udp, packet, &peer, peer_len);
+        if (!valid) {
+            for (0..8) |_| try s.step(0);
+            if (try probeAvailable(p.client, &buf)) return error.UnmatchedResponse;
+            packet = try a.dupe(u8, buf[0..try good.encode(&buf)]);
+            upstream = good;
+            try probeSend(p.udp, packet, &peer, peer_len);
+        }
+        for (0..count) |id| {
+            const len = try p.receive(p.client, &buf, null, null);
+            const reply = try wire.Message.parse(a, buf[0..len]);
+            if (!reply.flags.qr or reply.id != id or reply.question.len != 1 or !std.mem.eql(u8, reply.question[0].name, question.name)) return error.UnmatchedResponse;
+            if (retry and case != .tcp_answer) {
+                if (reply.flags.rcode != 2 or s.cache.map.count() != 0) return error.TruncatedCached;
+                continue;
+            }
+            const m = upstream.?;
+            const opt = try m.edns();
+            const ext = if (opt) |o| o.ext_rcode else 0;
+            const expected = if (ext == 0 and m.flags.rcode != 0 and m.flags.rcode != 3) 2 else m.flags.rcode;
+            if (reply.flags.rcode != expected) return error.RcodeLost;
+            if (ext != 0 and (try reply.edns()).?.ext_rcode != ext) return error.RcodeLost;
+            if (ext != 0 and s.cache.map.count() != 0) return error.ErrorCached;
+            if (expected != 2) try probeTtls(m, reply, 0);
+        }
+        // Exercise a real cache hit after advancing the entry's age by two seconds.
+        var keys: [257]u8 = undefined;
+        if (s.cache.get(forward.key(&keys, name, .a), @divTrunc(nowMs(), 1000))) |entry| {
+            const lifetime = entry.expires - entry.inserted;
+            for ([_][]const wire.RR{ upstream.?.answer, upstream.?.authority, upstream.?.additional }) |section| {
+                for (section) |rr| if (rr.type != .opt and lifetime > rr.ttl) return error.TtlExtended;
+            }
+            if (case == .cname_nodata and lifetime > 30) return error.TtlExtended;
+            if (lifetime <= 3) return;
+            const e = @constCast(entry);
+            e.inserted -= 2;
+            e.expires -= 2;
+            const query: wire.Message = .{ .id = 100, .question = &.{question}, .additional = &.{(wire.Opt{ .payload = 1232 }).toRR()} };
+            const len = try query.encode(&buf);
+            try probeSend(p.client, buf[0..len], null, 0);
+            const got = try p.receive(p.client, &buf, null, null);
+            const reply = try wire.Message.parse(a, buf[0..got]);
+            if (reply.id != 100) return error.UnmatchedResponse;
+            try probeTtls(upstream.?, reply, 2);
+        }
+    }
+
+    fn receive(p: *ForwardProbe, fd: posix.fd_t, buf: []u8, peer: ?*PosixAddress, peer_len: ?*posix.socklen_t) !usize {
+        for (0..1000) |_| {
+            try p.l.server.step(0);
+            const rc = sys.recvfrom(fd, buf.ptr, buf.len, 0, if (peer) |addr| &addr.any else null, peer_len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .AGAIN, .INTR => {},
+                else => return error.Receive,
+            }
+        }
+        return error.NoResponse;
+    }
+};
+
+fn probeSend(fd: posix.fd_t, bytes: []const u8, peer: ?*PosixAddress, len: posix.socklen_t) !void {
+    const rc = sys.sendto(fd, bytes.ptr, bytes.len, 0, if (peer) |addr| &addr.any else null, len);
+    if (posix.errno(rc) != .SUCCESS or rc != bytes.len) return error.Send;
+}
+
+fn probeAvailable(fd: posix.fd_t, buf: []u8) !bool {
+    const rc = sys.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => true,
+        .AGAIN, .INTR => false,
+        else => error.Receive,
+    };
+}
+
+fn probeTcp(listener: posix.fd_t, reply: []const u8) void {
+    if (!waitFd(listener, posix.POLL.IN, nowMs() + 1000)) return;
+    var peer: PosixAddress = undefined;
+    const fd = acceptConn(listener, &peer) orelse return;
+    defer _ = sys.close(fd);
+    var buf: [1024]u8 = undefined;
+    var got: usize = 0;
+    while (frameEnd(buf[0..got]) == null) {
+        if (!waitFd(fd, posix.POLL.IN, nowMs() + 1000)) return;
+        const rc = sys.recvfrom(fd, buf[got..].ptr, buf.len - got, 0, null, null);
+        if (posix.errno(rc) != .SUCCESS or rc == 0) return;
+        got += @intCast(rc);
+    }
+    sendAll(fd, reply, nowMs() + 1000) catch {};
+}
+
+fn probeTtls(upstream: wire.Message, reply: wire.Message, age: u32) !void {
+    inline for (.{ "answer", "authority", "additional" }) |section| {
+        for (@field(reply, section)) |rr| {
+            if (rr.type == .opt) continue;
+            const original = for (@field(upstream, section)) |src| {
+                if (src.type == rr.type and std.mem.eql(u8, src.rdata, rr.rdata) and std.mem.eql(u8, src.name, rr.name)) break src;
+            } else return error.UnmatchedRecord;
+            if (rr.ttl > original.ttl -| age) return error.TtlExtended;
+        }
+    }
+}
+
+test "review A6 A17 A18: fake upstream validates questions, TCP truncation, rcodes and cache TTLs" {
+    var probe = try ForwardProbe.init(testing.allocator);
+    defer probe.deinit();
+    for (std.enums.values(ForwardProbe.Case)) |case| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        try probe.run(arena.allocator(), "arbitrary upstream bytes", case, 64);
     }
 }

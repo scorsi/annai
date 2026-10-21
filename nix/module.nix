@@ -12,6 +12,12 @@ let
   cfg = config.services.annai;
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [ "services" "annai" "forwarding" "minTtl" ] ''
+      Remove this option: upstream TTLs are never raised (ADR 0012: docs/adr/0012-cache-ttl-bounds.md).
+    '')
+  ];
+
   options.services.annai = {
     enable = lib.mkEnableOption "annai, the homelab DNS server";
 
@@ -54,12 +60,6 @@ in
       ];
       defaultText = lib.literalExpression ''[ "9.9.9.9" "2620:fe::fe" ] in uchi mode, [ ] otherwise'';
       description = "Upstream resolver addresses, tried in order (ADR 0008). `uchi` mode only; empty = names outside the zones are REFUSED.";
-    };
-
-    forwarding.minTtl = mkOption {
-      type = types.ints.between 0 2147483647;
-      default = 0;
-      description = "Lower clamp of the lifetime of a cached positive answer, in seconds (ADR 0008).";
     };
 
     forwarding.maxTtl = mkOption {

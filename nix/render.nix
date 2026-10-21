@@ -25,7 +25,6 @@ let
     // lib.optionalAttrs (cfg.forwarding.upstreams != [ ]) {
       forwarding = {
         inherit (cfg.forwarding) upstreams;
-        min_ttl = cfg.forwarding.minTtl;
         max_ttl = cfg.forwarding.maxTtl;
         cache_bytes = cfg.forwarding.cacheBytes;
       };

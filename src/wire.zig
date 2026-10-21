@@ -112,9 +112,17 @@ pub const Message = struct {
 
     /// The OPT RR, if any. Two of them, or one not owned by the root, is a FORMERR (RFC 6891 §6.1.1).
     pub fn edns(m: Message) error{Malformed}!?Opt {
+        for (m.answer) |r| if (r.type == .opt) return error.Malformed;
+        for (m.authority) |r| if (r.type == .opt) return error.Malformed;
         var found: ?Opt = null;
         for (m.additional) |r| if (r.type == .opt) {
             if (found != null or r.name.len != 1) return error.Malformed;
+            var options: Reader = .{ .buf = r.rdata };
+            while (options.pos < options.buf.len) {
+                _ = try options.int(u16);
+                const len = try options.int(u16);
+                _ = try options.take(len);
+            }
             found = Opt.fromRR(r);
         };
         return found;
@@ -142,14 +150,26 @@ pub fn nameFromText(out: *[255]u8, text: []const u8) error{Malformed}![]const u8
 
 /// Shape of the RDATA whose names may be compressed on the wire (RFC 1035 §3.3, RFC 3597 §4; SRV
 /// is decompressed on parse but never compressed on emit).
-const Field = union(enum) { name, bytes: u16 };
+const Field = union(enum) { name, bytes: u16, string, rest };
 fn layout(t: Type) ?[]const Field {
-    return switch (t) {
-        .ns, .cname, .ptr => &[_]Field{.name},
-        .mx => &[_]Field{ .{ .bytes = 2 }, .name },
-        .soa => &[_]Field{ .name, .name, .{ .bytes = 20 } },
-        .srv => &[_]Field{ .{ .bytes = 6 }, .name },
+    return switch (@intFromEnum(t)) {
+        2, 3, 4, 5, 7, 8, 9, 12 => &[_]Field{.name}, // NS, MD, MF, CNAME, MB, MG, MR, PTR
+        15, 18, 21 => &[_]Field{ .{ .bytes = 2 }, .name }, // MX, AFSDB, RT
+        6 => &[_]Field{ .name, .name, .{ .bytes = 20 } }, // SOA
+        33 => &[_]Field{ .{ .bytes = 6 }, .name }, // SRV
+        14, 17 => &[_]Field{ .name, .name }, // MINFO, RP
+        24 => &[_]Field{ .{ .bytes = 18 }, .name, .rest }, // SIG
+        26 => &[_]Field{ .{ .bytes = 2 }, .name, .name }, // PX
+        30 => &[_]Field{ .name, .rest }, // NXT
+        35 => &[_]Field{ .{ .bytes = 4 }, .string, .string, .string, .name }, // NAPTR
         else => null,
+    };
+}
+
+fn compressRdata(t: Type) bool {
+    return switch (@intFromEnum(t)) {
+        2...9, 12, 14, 15 => true,
+        else => false,
     };
 }
 
@@ -230,7 +250,7 @@ fn parseRRs(a: Allocator, r: *Reader, count: u16, last: *usize) ParseError![]con
 /// Rewrites the `raw_len` bytes of RDATA just read by `outer` with its names expanded; pointers
 /// may reach any earlier byte of the packet. The RDATA must be consumed exactly.
 fn decompress(a: Allocator, outer: *Reader, raw_len: usize, fields: []const Field) ParseError![]const u8 {
-    var out: [2 * 255 + 20]u8 = undefined;
+    const out = try a.alloc(u8, raw_len + 2 * 255);
     var len: usize = 0;
     var r: Reader = .{ .buf = outer.buf[0..outer.pos], .pos = outer.pos - raw_len, .hops = outer.hops };
     defer outer.hops = r.hops;
@@ -241,13 +261,19 @@ fn decompress(a: Allocator, outer: *Reader, raw_len: usize, fields: []const Fiel
             @memcpy(out[len..][0..n.len], n);
             len += n.len;
         },
+        .string, .rest => {
+            const n = if (f == .rest) r.buf.len - r.pos else 1 + @as(usize, (try r.take(1))[0]);
+            if (f == .string) r.pos -= 1;
+            @memcpy(out[len..][0..n], try r.take(n));
+            len += n;
+        },
         .bytes => |n| {
             @memcpy(out[len..][0..n], try r.take(n));
             len += n;
         },
     };
     if (r.pos != r.buf.len) return error.Malformed;
-    return a.dupe(u8, out[0..len]);
+    return out[0..len];
 }
 
 /// Incremental encoder: the header counts are kept up to date in `buf`, and a question or RR that
@@ -291,9 +317,15 @@ pub const Writer = struct {
             for (fields.?) |f| switch (f) {
                 .name => {
                     var tmp: [255]u8 = undefined;
-                    try w.name(try rd.name(&tmp), r.type != .srv);
+                    try w.name(try rd.name(&tmp), compressRdata(r.type));
                 },
                 .bytes => |n| try w.bytes(try rd.take(n)),
+                .rest => try w.bytes(try rd.take(rd.buf.len - rd.pos)),
+                .string => {
+                    const n = 1 + @as(usize, (try rd.take(1))[0]);
+                    rd.pos -= 1;
+                    try w.bytes(try rd.take(n));
+                },
             };
             if (rd.pos != r.rdata.len) return error.Malformed;
         }

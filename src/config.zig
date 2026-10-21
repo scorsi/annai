@@ -56,8 +56,7 @@ pub const KeyRef = struct {
 pub const Forwarding = struct {
     /// Port 53, tried in order.
     upstreams: []const std.Io.net.IpAddress,
-    /// Clamps of the positive cache lifetime; negative answers only get `max_ttl` (RFC 2308).
-    min_ttl: u32 = 0,
+    /// Upper bound on whole-packet cache lifetime, positive and negative.
     max_ttl: u32 = 86400,
     /// Hard cap on the cache: packet bytes plus per-entry overhead, LRU eviction beyond it.
     cache_bytes: usize = 16 << 20,
@@ -153,9 +152,10 @@ pub fn checkConfig(a: Allocator, text: []const u8, d: *Diag) Error!Config {
     // ADR 0002: configuration that does not match the mode is an error.
     var forwarding: ?Forwarding = null;
     if (root.get("forwarding")) |v| {
-        if (mode != .uchi) return d.fail("forwarding: only allowed in uchi mode", .{});
         const t = try table(v, "forwarding", d);
-        try checkKeys(t, &.{ "upstreams", "min_ttl", "max_ttl", "cache_bytes" }, "forwarding", d);
+        if (t.contains("min_ttl")) return d.fail("forwarding: removed key \"min_ttl\"; remove this option (ADR 0012: docs/adr/0012-cache-ttl-bounds.md)", .{});
+        if (mode != .uchi) return d.fail("forwarding: only allowed in uchi mode", .{});
+        try checkKeys(t, &.{ "upstreams", "max_ttl", "cache_bytes" }, "forwarding", d);
         var upstreams: std.ArrayList(std.Io.net.IpAddress) = .empty;
         for (try array(try need(t, "upstreams", "forwarding", d), "forwarding.upstreams", d)) |u| {
             const s = try string(u, "forwarding.upstreams", d);
@@ -163,10 +163,8 @@ pub fn checkConfig(a: Allocator, text: []const u8, d: *Diag) Error!Config {
         }
         var f: Forwarding = .{ .upstreams = upstreams.items };
         // RFC 2181: TTLs are 31 bits.
-        if (t.get("min_ttl")) |x| f.min_ttl = try int(u31, x, "forwarding.min_ttl", d);
         if (t.get("max_ttl")) |x| f.max_ttl = try int(u31, x, "forwarding.max_ttl", d);
         if (t.get("cache_bytes")) |x| f.cache_bytes = try int(usize, x, "forwarding.cache_bytes", d);
-        if (f.min_ttl > f.max_ttl) return d.fail("forwarding: min_ttl {d} is above max_ttl {d}", .{ f.min_ttl, f.max_ttl });
         forwarding = f;
     }
     var update: ?Update = null;
@@ -549,8 +547,7 @@ test "annai.toml" {
     const uchi = "mode = \"uchi\"\nlisten = [\"0.0.0.0:53\", \"[::]:53\"]\nzones = [\"uchi.toml\"]\n";
     const soto = "mode = \"soto\"\nlisten = [\"192.0.2.1:53\"]\n";
     try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\", \"2620:fe::fe\"]", null);
-    try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\nmin_ttl = 30\nmax_ttl = 3600\ncache_bytes = 1048576", null);
-    try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\nmin_ttl = 60\nmax_ttl = 30", "min_ttl 60 is above max_ttl 30");
+    try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\nmax_ttl = 3600\ncache_bytes = 1048576", null);
     try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\nmax_ttl = 2147483648", "out of range");
     try expectConfig(uchi ++ "[forwarding]\nupstreams = [\"9.9.9.9\"]\ncache_bytes = -1", "out of range");
     try expectConfig(soto ++ "[[update.keys]]\nname = \"hanko\"\nsecret_file = \"/run/secrets/k\"", null);
@@ -579,4 +576,12 @@ test "annai.toml" {
     try expectConfig(uchi ++ "metrics = \"[::]:9153\"", "is not 127.0.0.1:<port>");
     try expectConfig(uchi ++ "metrics = \"127.0.0.1:0\"", "is not 127.0.0.1:<port>");
     try expectConfig(uchi ++ "metrics = \"localhost:9153\"", "not address:port");
+}
+
+test "annai.toml: min_ttl was removed by ADR 0012" {
+    inline for (.{ "uchi", "soto" }) |mode| {
+        inline for (.{ "0", "30", "\"unused\"" }) |value| {
+            try expectConfig("mode = \"" ++ mode ++ "\"\nlisten = [\"127.0.0.1:53\"]\n[forwarding]\nupstreams = [\"9.9.9.9\"]\nmin_ttl = " ++ value, "forwarding: removed key \"min_ttl\"; remove this option (ADR 0012: docs/adr/0012-cache-ttl-bounds.md)");
+        }
+    }
 }

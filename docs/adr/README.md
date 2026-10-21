@@ -11,7 +11,8 @@ MADR-lite: one decision per file, `NNNN-slug.md`, sections Context / Decision / 
 | [0005](0005-naming-scheme.md) | Naming scheme |
 | [0006](0006-dynamic-updates-for-acme.md) | Dynamic updates for ACME DNS-01 |
 | [0007](0007-wire-protocol-scope.md) | Wire protocol scope |
-| [0008](0008-upstream-forwarding-and-cache.md) | Upstream forwarding and cache |
+| [0008](0008-upstream-forwarding-and-cache.md) | Upstream forwarding and cache (amended by 0012) |
 | [0009](0009-public-ns-hosting.md) | Public nameserver hosting |
 | [0010](0010-integration-contracts.md) | Integration contracts with kekkai, genkan, hanko, and the deployment repository |
 | [0011](0011-testing-and-operations.md) | Testing and operations |
+| [0012](0012-cache-ttl-bounds.md) | Cache TTL bounds (accepted 2026-10-21; amends 0008) |

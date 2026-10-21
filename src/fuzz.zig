@@ -9,12 +9,17 @@
 //! input, framed and then raw, goes over one connection in chunks the input's hash picks, and
 //! the stream invariants of `Loopback.checkStream` must hold (review A17).
 //!
+//! The `forward` target drives a fake UDP/TCP upstream through the real server, mutating raw
+//! responses and matching messages: ID/question/source checks, TC twice, short TCP frames,
+//! mixed TTLs, CNAME negatives, legacy compression, extended rcodes and 64 coalesced waiters.
+//! Its oracles check response questions, rcodes, cache expiry and per-record TTL ageing.
+//!
 //! The `update-state` target builds a signed UPDATE from the input's hash (so mutations never
 //! break the MAC) and sends it through `engine.respond`, sometimes over a nearly full overlay or
 //! with a failing allocation: a non-NOERROR answer must leave the overlay exactly as it was, and
 //! the overlay must keep the ADR 0006 policy and valid RRsets (review A3, A8, A17).
 //!
-//! By hand: `zig build fuzz -- <codec|respond|update|update-state|tcp> <seconds> [seed]` (or `nix run .#fuzz`, in
+//! By hand: `zig build fuzz -- <codec|respond|update|update-state|tcp|forward> <seconds> [seed]` (or `nix run .#fuzz`, in
 //! ReleaseSafe); findings are `fuzz: ...` lines on stderr. Every finding becomes a line of
 //! src/corpus/fuzz.txt, which `zig build test` replays through every target.
 
@@ -28,7 +33,7 @@ const config = @import("config.zig");
 const server = @import("server.zig");
 const Allocator = std.mem.Allocator;
 
-pub const Target = enum { codec, respond, update, @"update-state", tcp };
+pub const Target = enum { codec, respond, update, @"update-state", tcp, forward };
 
 /// Per-request memory a message of at most 64 KiB may take; more is a finding.
 pub const max_request_bytes = 8 << 20;
@@ -51,6 +56,7 @@ pub const Fixture = struct {
     /// The `tcp` target's server, started on first use.
     loopback: ?*server.Loopback = null,
     stream: [2 * max_packet + 2]u8 = undefined,
+    forward_probe: ?server.ForwardProbe = null,
 
     pub fn init(gpa: Allocator) !*Fixture {
         const f = try gpa.create(Fixture);
@@ -76,6 +82,7 @@ pub const Fixture = struct {
 
     pub fn deinit(f: *Fixture) void {
         if (f.loopback) |l| l.deinit();
+        if (f.forward_probe) |*p| p.deinit();
         f.overlay.deinit();
         f.arena.deinit();
         f.gpa.destroy(f);
@@ -130,6 +137,16 @@ pub const Fixture = struct {
             .update => try f.applyUpdate(a, packet),
             .@"update-state" => try f.updateState(a, packet),
             .tcp => try f.tcp(packet),
+            .forward => {
+                if (f.forward_probe == null) f.forward_probe = server.ForwardProbe.init(f.gpa) catch return error.Stream;
+                var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(17, packet));
+                const rand = prng.random();
+                const cases = std.enums.values(server.ForwardProbe.Case);
+                f.forward_probe.?.run(a, packet, cases[rand.uintLessThan(usize, cases.len)], if (rand.uintLessThan(u8, 8) == 0) 64 else 1) catch |e| {
+                    std.debug.print("fuzz: forward case failed: {s}\n", .{@errorName(e)});
+                    return error.Invariant;
+                };
+            },
         }
         if (f.fba.end_index > max_request_bytes) return error.Memory;
     }
@@ -397,7 +414,7 @@ fn watchdog(io: std.Io) void {
     }
 }
 
-const usage = "usage: annai-fuzz <codec|respond|update|update-state|tcp> <seconds> [seed]\n";
+const usage = "usage: annai-fuzz <codec|respond|update|update-state|tcp|forward> <seconds> [seed]\n";
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());

@@ -21,5 +21,5 @@ pub fn build(b: *std.Build) void {
     fuzz.addOptions("build_options", options); // the `tcp` target runs src/server.zig
     const run_fuzz = b.addRunArtifact(b.addExecutable(.{ .name = "annai-fuzz", .root_module = fuzz }));
     if (b.args) |args| run_fuzz.addArgs(args);
-    b.step("fuzz", "Fuzz a target: zig build fuzz -- <codec|respond|update|update-state|tcp> <seconds> [seed]").dependOn(&run_fuzz.step);
+    b.step("fuzz", "Fuzz a target: zig build fuzz -- <codec|respond|update|update-state|tcp|forward> <seconds> [seed]").dependOn(&run_fuzz.step);
 }

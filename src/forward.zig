@@ -17,21 +17,35 @@ pub fn key(buf: *[257]u8, lower_name: []const u8, t: wire.Type) []const u8 {
     return buf[0 .. lower_name.len + 2];
 }
 
-/// How long an upstream answer may be cached, or null when it must not be (ADR 0008):
-/// positive = min(TTL of the answer RRs) clamped to [min_ttl, max_ttl]; NXDOMAIN and NODATA =
-/// min(SOA TTL, SOA MINIMUM) of the authority SOA, capped by max_ttl (RFC 2308 §5), and never
-/// cached without that SOA. Other rcodes are not cached.
-pub fn lifetime(m: wire.Message, min_ttl: u32, max_ttl: u32) ?u32 {
-    const rcode = m.flags.rcode;
-    if (rcode == 0 and m.answer.len > 0) {
-        var t: u32 = std.math.maxInt(u32);
-        for (m.answer) |rr| t = @min(t, rr.ttl);
-        return std.math.clamp(t, min_ttl, max_ttl);
+/// Whole-packet caching expires before any retained RR does (ADR 0012).
+pub fn lifetime(m: wire.Message, max_ttl: u32) ?u32 {
+    if (m.flags.tc) return null;
+    const opt = m.edns() catch return null;
+    if (opt) |o| if (o.ext_rcode != 0) return null;
+    if (m.flags.rcode != 0 and m.flags.rcode != 3) return null;
+    var ttl = max_ttl;
+    var positive = false;
+    for (m.answer) |rr| {
+        if (m.question.len == 1) {
+            if (rr.type == m.question[0].type or m.question[0].type == .any) positive = true;
+        } else if (rr.type != .cname) positive = true;
     }
-    if (rcode != 0 and rcode != 3) return null;
+    if (m.flags.rcode == 3 or !positive) {
+        const neg = negativeTtl(m) orelse return null;
+        ttl = @min(ttl, neg);
+    }
+    for ([_][]const wire.RR{ m.answer, m.authority, m.additional }) |section| {
+        for (section) |rr| if (rr.type != .opt) {
+            ttl = @min(ttl, rr.ttl);
+        };
+    }
+    return ttl;
+}
+
+pub fn negativeTtl(m: wire.Message) ?u32 {
     for (m.authority) |rr| if (rr.type == .soa and rr.rdata.len >= 20) {
         const minimum = std.mem.readInt(u32, rr.rdata[rr.rdata.len - 4 ..][0..4], .big);
-        return @min(rr.ttl, minimum, max_ttl);
+        return @min(rr.ttl, minimum);
     };
     return null;
 }
@@ -50,6 +64,7 @@ pub const Cache = struct {
         packet: []u8,
         /// Monotonic seconds.
         expires: i64,
+        inserted: i64,
 
         fn size(e: *const Entry) usize {
             return e.key.len + e.packet.len + entry_overhead;
@@ -84,7 +99,7 @@ pub const Cache = struct {
         if (ttl == 0 or k.len + packet.len + entry_overhead > c.cap) return;
         const e = try c.gpa.create(Entry);
         errdefer c.gpa.destroy(e);
-        e.* = .{ .key = try c.gpa.dupe(u8, k), .packet = undefined, .expires = now + ttl };
+        e.* = .{ .key = try c.gpa.dupe(u8, k), .packet = undefined, .expires = now + ttl, .inserted = now };
         errdefer c.gpa.free(e.key);
         e.packet = try c.gpa.dupe(u8, packet);
         errdefer c.gpa.free(e.packet);
@@ -117,21 +132,19 @@ fn soa(ttl: u32, comptime minimum: u32) wire.RR {
     return r;
 }
 
-test "lifetime: positive clamped, negative from the SOA, never without one" {
+test "lifetime: positive capped, negative from the SOA, never without one" {
     const pos: wire.Message = .{ .answer = &.{ testRR(.cname, 600), testRR(.a, 300) } };
-    try testing.expectEqual(@as(?u32, 300), lifetime(pos, 0, 86400));
-    try testing.expectEqual(@as(?u32, 60), lifetime(pos, 0, 60));
-    try testing.expectEqual(@as(?u32, 900), lifetime(pos, 900, 86400));
-    try testing.expectEqual(@as(?u32, 0), lifetime(.{ .answer = &.{testRR(.a, 0)} }, 0, 86400));
+    try testing.expectEqual(@as(?u32, 300), lifetime(pos, 86400));
+    try testing.expectEqual(@as(?u32, 60), lifetime(pos, 60));
+    try testing.expectEqual(@as(?u32, 0), lifetime(.{ .answer = &.{testRR(.a, 0)} }, 86400));
 
     const nx: wire.Message = .{ .flags = .{ .rcode = 3 }, .authority = &.{soa(3600, 300)} };
-    try testing.expectEqual(@as(?u32, 300), lifetime(nx, 0, 86400));
-    try testing.expectEqual(@as(?u32, 100), lifetime(nx, 0, 100));
-    try testing.expectEqual(@as(?u32, 300), lifetime(nx, 900, 86400)); // min_ttl does not raise negatives
+    try testing.expectEqual(@as(?u32, 300), lifetime(nx, 86400));
+    try testing.expectEqual(@as(?u32, 100), lifetime(nx, 100));
     const nodata: wire.Message = .{ .authority = &.{soa(30, 300)} };
-    try testing.expectEqual(@as(?u32, 30), lifetime(nodata, 0, 86400));
-    try testing.expectEqual(@as(?u32, null), lifetime(.{ .flags = .{ .rcode = 3 } }, 0, 86400));
-    try testing.expectEqual(@as(?u32, null), lifetime(.{ .flags = .{ .rcode = 2 }, .authority = &.{soa(30, 300)} }, 0, 86400));
+    try testing.expectEqual(@as(?u32, 30), lifetime(nodata, 86400));
+    try testing.expectEqual(@as(?u32, null), lifetime(.{ .flags = .{ .rcode = 3 } }, 86400));
+    try testing.expectEqual(@as(?u32, null), lifetime(.{ .flags = .{ .rcode = 2 }, .authority = &.{soa(30, 300)} }, 86400));
 }
 
 test "cache: expiry, replacement, LRU eviction under the byte cap" {
@@ -160,4 +173,23 @@ test "cache: expiry, replacement, LRU eviction under the byte cap" {
     try c.put("ff", "x" ** (3 * one), 10, 0); // above the cap: not stored, nothing evicted
     try testing.expect(c.get("ee", 1) == null and c.get("ff", 1) == null);
     try testing.expectEqual(3 * one, c.used);
+}
+
+test "review A5: mixed sections and CNAME negatives expire before every retained RR" {
+    const q: wire.Question = .{ .name = "\x00", .type = .a };
+    const cname: wire.RR = .{ .name = "\x00", .type = .cname, .ttl = 300, .rdata = "\x01x\x00" };
+    const address: wire.RR = .{ .name = "\x01x\x00", .type = .a, .ttl = 200, .rdata = "1234" };
+    const pos: wire.Message = .{ .question = &.{q}, .answer = &.{ cname, address }, .additional = &.{testRR(.a, 10)} };
+    try testing.expectEqual(@as(?u32, 10), lifetime(pos, 86400));
+    for ([_]u4{ 0, 3 }) |rcode| {
+        var neg: wire.Message = .{ .question = &.{q}, .flags = .{ .rcode = rcode }, .answer = &.{cname}, .authority = &.{soa(3600, 30)} };
+        try testing.expectEqual(@as(?u32, 30), lifetime(neg, 86400));
+        neg.answer = &.{.{ .name = cname.name, .type = .cname, .ttl = 5, .rdata = cname.rdata }};
+        try testing.expectEqual(@as(?u32, 5), lifetime(neg, 86400));
+        neg.authority = &.{};
+        try testing.expectEqual(@as(?u32, null), lifetime(neg, 86400));
+    }
+    var truncated = pos;
+    truncated.flags.tc = true;
+    try testing.expectEqual(@as(?u32, null), lifetime(truncated, 86400));
 }

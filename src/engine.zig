@@ -10,6 +10,7 @@ const zone = @import("zone.zig");
 const tsig = @import("tsig.zig");
 const update = @import("update.zig");
 const log = @import("log.zig");
+const forwarding = @import("forward.zig");
 const metrics = @import("metrics.zig");
 
 pub const Rcode = wire.Rcode;
@@ -179,18 +180,24 @@ fn lookup(z: *const zone.Zone, overlay: ?*const update.Overlay, name: []const u8
     return z.lookup(source[0 .. 2 + ce.len]);
 }
 
-/// The answer to a forwarded query from a validated upstream response, every TTL set to `ttl`
-/// (the remaining cache lifetime); a null or unparsable `upstream` is SERVFAIL. RA=1, AA=0 (ADR 0008).
-pub fn forwarded(arena: std.mem.Allocator, f: Forward, upstream: ?[]const u8, ttl: u32, out: []u8) usize {
+/// The answer to a validated upstream response, each TTL aged by `age` seconds; a null or
+/// unparsable `upstream` is SERVFAIL. RA=1, AA=0 (ADR 0008).
+pub fn forwarded(arena: std.mem.Allocator, f: Forward, upstream: ?[]const u8, age: u32, out: []u8) usize {
     var r: Response = .{ .flags = .{ .qr = true, .rd = f.rd, .ra = true }, .limit = f.limit, .question = f.question, .opt = f.opt, .arena = arena };
     const m = wire.Message.parse(arena, upstream orelse return r.finish(f.id, out, .servfail).?) catch return r.finish(f.id, out, .servfail).?;
+    const opt = m.edns() catch return r.finish(f.id, out, .servfail).?;
+    if (opt) |o| if (o.ext_rcode != 0) {
+        if (r.opt) |*client| client.ext_rcode = o.ext_rcode else return r.finish(f.id, out, .servfail).?;
+    };
+    r.flags.tc = m.flags.tc;
     var sections: [3][]wire.RR = undefined;
     for (&sections, [_][]const wire.RR{ m.answer, m.authority, m.additional }) |*dst, src| {
         var n: usize = 0;
         dst.* = arena.alloc(wire.RR, src.len) catch return r.finish(f.id, out, .servfail).?;
         for (src) |rr| if (rr.type != .opt) { // the upstream's OPT is not the client's
             dst.*[n] = rr;
-            dst.*[n].ttl = ttl;
+            const bound = if (rr.type == .soa) @min(rr.ttl, forwarding.negativeTtl(m) orelse rr.ttl) else rr.ttl;
+            dst.*[n].ttl = bound -| age;
             n += 1;
         };
         dst.* = dst.*[0..n];
@@ -654,7 +661,7 @@ test "forwarding: names outside the zones are handed over, answers get RA, the T
     try testing.expect(!full.flags.aa and !full.flags.tc);
     try testing.expectEqualSlices(u8, "\x03WwW\x07example\x03NET\x00", full.question[0].name);
     try testing.expectEqual(@as(usize, 8), full.answer.len);
-    for (full.answer) |rr| try testing.expectEqual(@as(u32, 42), rr.ttl);
+    for (full.answer) |rr| try testing.expectEqual(@as(u32, 258), rr.ttl);
     try testing.expectEqual(@as(u16, max_udp_payload), (try full.edns()).?.payload);
 
     const udp = try wire.Message.parse(a, f.out[0..forwarded(a, q, packet, 42, &f.out)]);
@@ -811,4 +818,150 @@ test "an UPDATE signed with a truncated MAC is applied and answered signed (revi
         _ = try std.fmt.hexToBytes(&want, tsig.vector.truncated_response_mac);
         try testing.expectEqualSlices(u8, &want, f.out[f.last_len - 38 .. f.last_len - 6]);
     }
+}
+
+test "review A5: forwarding ages each record without extending its TTL" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const name = "\x03www\x07example\x03net\x00";
+    const q: wire.Question = .{ .name = name, .type = .a };
+    const f: Forward = .{ .id = 7, .rd = true, .question = q, .opt = .{ .payload = 1232 }, .limit = 1232 };
+    var up: [1232]u8 = undefined;
+    var out: [1232]u8 = undefined;
+    const m: wire.Message = .{ .flags = .{ .qr = true }, .question = &.{q}, .answer = &.{
+        .{ .name = name, .type = .a, .ttl = 300, .rdata = "1234" },
+        .{ .name = name, .type = .a, .ttl = 10, .rdata = "5678" },
+    }, .additional = &.{.{ .name = name, .type = .a, .ttl = 5, .rdata = "abcd" }} };
+    const n = try m.encode(&up);
+    for ([_]u32{ 0, 3 }) |age| {
+        const aged = try wire.Message.parse(a, out[0..forwarded(a, f, up[0..n], age, &out)]);
+        try testing.expectEqual(300 - age, aged.answer[0].ttl);
+        try testing.expectEqual(10 - age, aged.answer[1].ttl);
+        try testing.expectEqual(5 - age, aged.additional[0].ttl);
+    }
+    for ([_]u4{ 0, 3 }) |rcode| {
+        const negative: wire.Message = .{ .flags = .{ .qr = true, .rcode = rcode }, .question = &.{q}, .answer = &.{.{ .name = name, .type = .cname, .ttl = 300, .rdata = "\x01x\x00" }}, .authority = &.{.{ .name = "\x00", .type = .soa, .ttl = 3600, .rdata = "\x00\x00" ++ "\x00" ** 19 ++ "\x1e" }} };
+        const len = try negative.encode(&up);
+        const aged = try wire.Message.parse(a, out[0..forwarded(a, f, up[0..len], 3, &out)]);
+        try testing.expectEqual(@as(u32, 297), aged.answer[0].ttl);
+        try testing.expectEqual(@as(u32, 27), aged.authority[0].ttl);
+    }
+}
+
+test "review A6: a forwarded truncated answer retains TC and cannot be cached" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f: Forward = .{ .id = 7, .rd = true, .question = .{ .name = "\x00", .type = .a }, .opt = null, .limit = 512 };
+    const m: wire.Message = .{ .flags = .{ .qr = true, .tc = true }, .answer = &.{.{ .name = "\x00", .type = .a, .ttl = 60, .rdata = "1234" }} };
+    var up: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    const n = try m.encode(&up);
+    const reply = try wire.Message.parse(arena.allocator(), out[0..forwarded(arena.allocator(), f, up[0..n], 0, &out)]);
+    try testing.expect(reply.flags.tc);
+    try testing.expectEqual(@as(?u32, null), forwarding.lifetime(m, 86400));
+}
+
+test "review A18: upstream BADVERS remains an extended error or explicit failure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Forward = .{ .id = 7, .rd = true, .question = .{ .name = "\x00", .type = .a }, .opt = .{ .payload = 1232 }, .limit = 1232 };
+    var up: [1232]u8 = undefined;
+    var out: [1232]u8 = undefined;
+    for ([_]struct { ext: u8, low: u4 }{ .{ .ext = 1, .low = 0 }, .{ .ext = 15, .low = 7 }, .{ .ext = 255, .low = 15 } }) |code| {
+        const m: wire.Message = .{ .flags = .{ .qr = true, .rcode = code.low }, .additional = &.{(wire.Opt{ .payload = 1232, .ext_rcode = code.ext }).toRR()} };
+        const n = try m.encode(&up);
+        const bad = try wire.Message.parse(a, out[0..forwarded(a, f, up[0..n], 0, &out)]);
+        try testing.expectEqual(code.ext, (try bad.edns()).?.ext_rcode);
+        try testing.expectEqual(code.low, bad.flags.rcode);
+        try testing.expectEqual(@as(?u32, null), forwarding.lifetime(m, 86400));
+    }
+    const m: wire.Message = .{ .flags = .{ .qr = true }, .additional = &.{(wire.Opt{ .payload = 1232, .ext_rcode = 1 }).toRR()} };
+    const n = try m.encode(&up);
+    f.opt = null;
+    const failed = try wire.Message.parse(a, out[0..forwarded(a, f, up[0..n], 0, &out)]);
+    try testing.expectEqual(@as(u4, 2), failed.flags.rcode);
+}
+
+test "review A10: malformed EDNS placement and option framing get FORMERR" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const opt = (wire.Opt{ .payload = 1232 }).toRR();
+    const q: wire.Question = .{ .name = "\x04uchi\x07example\x03org\x00", .type = .a };
+    for ([_]wire.Message{
+        .{ .question = &.{q}, .answer = &.{opt} },
+        .{ .question = &.{q}, .authority = &.{opt}, .additional = &.{opt} },
+        .{ .question = &.{q}, .additional = &.{ opt, opt } },
+        .{ .question = &.{q}, .additional = &.{(wire.Opt{ .payload = 1232, .options = "\x00\x01\x00" }).toRR()} },
+        .{ .question = &.{q}, .additional = &.{(wire.Opt{ .payload = 1232, .options = "\x00\x01\x00\x02\xff" }).toRR()} },
+    }) |m| {
+        var buf: [512]u8 = undefined;
+        var query = m;
+        query.id = 0x1234;
+        query.flags.rd = true;
+        const n = try query.encode(&buf);
+        try expectRcode(try f.reply(buf[0..n], .udp), .formerr);
+    }
+    const valid: wire.Message = .{ .id = 0x1234, .flags = .{ .rd = true }, .question = &.{q}, .additional = &.{(wire.Opt{ .payload = 1232, .options = "\xff\xff\x00\x01x\x00\x01\x00\x00" }).toRR()} };
+    var buf: [512]u8 = undefined;
+    const n = try valid.encode(&buf);
+    try expectRcode(try f.reply(buf[0..n], .udp), .noerror);
+}
+
+test "review A11: legacy compressed RDATA survives a changed question dictionary" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const name = "\x03www\x07example\x03net\x00";
+    const target = "\x02ns\x07example\x03net\x00";
+    const f: Forward = .{ .id = 7, .rd = true, .question = .{ .name = "\x03WWW\x07EXAMPLE\x03NET\x00", .type = .ns }, .opt = null, .limit = 65535 };
+    var up: [65535]u8 = undefined;
+    var out: [65535]u8 = undefined;
+    for ([_]struct { t: u16, prefix: []const u8 = "", names: usize = 1, tail: []const u8 = "" }{
+        .{ .t = 3 }, // MD
+        .{ .t = 4 }, // MF
+        .{ .t = 7 }, // MB
+        .{ .t = 8 }, // MG
+        .{ .t = 9 }, // MR
+        .{ .t = 14, .names = 2 }, // MINFO
+        .{ .t = 17, .names = 2 }, // RP
+        .{ .t = 18, .prefix = "\x00\x01" }, // AFSDB
+        .{ .t = 21, .prefix = "\x00\x01" }, // RT
+        .{ .t = 24, .prefix = "\x00" ** 18, .tail = "signature" }, // SIG
+        .{ .t = 26, .prefix = "\x00\x01", .names = 2 }, // PX
+        .{ .t = 30, .tail = "bitmap" }, // NXT
+        .{ .t = 35, .prefix = "\x00\x01\x00\x02\x01s\x00\x03abc" }, // NAPTR
+    }) |case| {
+        var w = try wire.Writer.init(&up, 99, .{ .qr = true });
+        try w.question(.{ .name = name, .type = .ns });
+        const ns_at = w.len;
+        try w.rr(.answer, .{ .name = name, .type = .ns, .ttl = 300, .rdata = target });
+        // The NS RDATA begins after the two-byte owner and ten-byte fixed RR header.
+        const pointer: u16 = 0xc000 | @as(u16, @intCast(ns_at + 12));
+        var raw: [256]u8 = undefined;
+        var expected: [600]u8 = undefined;
+        @memcpy(raw[0..case.prefix.len], case.prefix);
+        @memcpy(expected[0..case.prefix.len], case.prefix);
+        var len = case.prefix.len;
+        var expanded = case.prefix.len;
+        for (0..case.names) |_| {
+            std.mem.writeInt(u16, raw[len..][0..2], pointer, .big);
+            len += 2;
+            @memcpy(expected[expanded..][0..target.len], target);
+            expanded += target.len;
+        }
+        @memcpy(raw[len..][0..case.tail.len], case.tail);
+        @memcpy(expected[expanded..][0..case.tail.len], case.tail);
+        const at = w.len;
+        try w.rr(.answer, .{ .name = "\x00", .type = @enumFromInt(65000), .ttl = 60, .rdata = raw[0 .. len + case.tail.len] });
+        std.mem.writeInt(u16, up[at + 1 ..][0..2], case.t, .big);
+        const reply = try wire.Message.parse(a, out[0..forwarded(a, f, up[0..w.len], 0, &out)]);
+        try testing.expectEqual(@as(usize, 2), reply.answer.len);
+        try testing.expectEqualSlices(u8, expected[0 .. expanded + case.tail.len], reply.answer[1].rdata);
+    }
+    const unknown: wire.Message = .{ .flags = .{ .qr = true }, .answer = &.{.{ .name = name, .type = @enumFromInt(65000), .ttl = 60, .rdata = "\xc0\x29" }} };
+    const n = try unknown.encode(&up);
+    const reply = try wire.Message.parse(a, out[0..forwarded(a, f, up[0..n], 0, &out)]);
+    try testing.expectEqualSlices(u8, "\xc0\x29", reply.answer[0].rdata);
 }

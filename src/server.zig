@@ -415,19 +415,17 @@ pub const Server = struct {
         if (n == 0) return s.close(token); // peer closed
         c.len += n;
         c.deadline = nowMs() + idle_timeout_ms;
-        while (c.len >= 2) {
-            const mlen = std.mem.readInt(u16, c.buf[0..2], .big);
-            if (c.len < 2 + mlen) return;
+        while (frameEnd(c.buf[0..c.len])) |end| {
             c.messages += 1;
             if (c.messages > max_messages_per_conn) return s.close(token);
-            if (s.respond(c.buf[2 .. 2 + mlen], .{ .tcp = .{ .token = token, .gen = c.gen } }, .{ .proto = .tcp, .client = c.peer, .start = nowNs() })) |reply| {
+            if (s.respond(c.buf[2..end], .{ .tcp = .{ .token = token, .gen = c.gen } }, .{ .proto = .tcp, .client = c.peer, .start = nowNs() })) |reply| {
                 std.mem.writeInt(u16, s.out[0..2], @intCast(reply.len), .big);
                 sendAll(c.fd, s.out[0 .. 2 + reply.len]) catch return s.close(token);
             }
             // A SERVFAIL delivered while forwarding may have closed this connection.
             if (s.slots[token] != .conn) return;
-            std.mem.copyForwards(u8, &c.buf, c.buf[2 + mlen .. c.len]);
-            c.len -= 2 + mlen;
+            std.mem.copyForwards(u8, &c.buf, c.buf[end..c.len]);
+            c.len -= end;
         }
     }
 
@@ -619,7 +617,7 @@ fn tcpExchange(addr: net.IpAddress, query: []const u8, buf: []u8) ?[]const u8 {
     }
     sendAll(fd, query) catch return null;
     var got: usize = 0;
-    while (got < 2 or got < 2 + @as(usize, std.mem.readInt(u16, buf[0..2], .big))) {
+    while (frameEnd(buf[0..got]) == null) {
         const rc = sys.recvfrom(fd, buf[got..].ptr, buf.len - got, 0, null, null);
         switch (posix.errno(rc)) {
             .SUCCESS => if (rc == 0) return null else {
@@ -629,7 +627,15 @@ fn tcpExchange(addr: net.IpAddress, query: []const u8, buf: []u8) ?[]const u8 {
             else => return null,
         }
     }
-    return buf[2 .. 2 + std.mem.readInt(u16, buf[0..2], .big)];
+    return buf[2..frameEnd(buf[0..got]).?];
+}
+
+/// End of the first length-prefixed message in `buf` (RFC 7766), null while it is incomplete.
+fn frameEnd(buf: []const u8) ?usize {
+    if (buf.len < 2) return null;
+    // usize: `2 + u16` traps on a 0xfffe/0xffff prefix, which crashed a public soto (2026-10-20).
+    const end = 2 + @as(usize, std.mem.readInt(u16, buf[0..2], .big));
+    return if (buf.len < end) null else end;
 }
 
 fn waitFd(fd: posix.fd_t, events: i16, deadline: i64) bool {
@@ -683,4 +689,18 @@ fn nowUnix() i64 {
     var ts: posix.timespec = undefined;
     _ = sys.clock_gettime(posix.CLOCK.REALTIME, &ts);
     return @intCast(ts.sec);
+}
+
+test "TCP framing: a 0xffff length prefix waits for more bytes instead of overflowing" {
+    // The connection buffer found in the core of the 2026-10-20 crash (29 bytes, prefix 0xffff).
+    var crash: [29]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&crash, "ffffffffffffffffffffffffffffffff001d0104fde8005ac000020100");
+    try std.testing.expectEqual(@as(?usize, null), frameEnd(&crash));
+    try std.testing.expectEqual(@as(?usize, null), frameEnd(&.{ 0xff, 0xfe }));
+    var full: [2 + max_message]u8 = @splat(0);
+    full[0] = 0xff;
+    full[1] = 0xff;
+    try std.testing.expectEqual(@as(?usize, full.len), frameEnd(&full));
+    try std.testing.expectEqual(@as(?usize, null), frameEnd(&.{0}));
+    try std.testing.expectEqual(@as(?usize, 3), frameEnd(&.{ 0, 1, 9, 0, 0 }));
 }

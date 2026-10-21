@@ -7,7 +7,9 @@
 //!
 //! The `tcp` target drives a real server on a loopback port (src/server.zig `Loopback`): the
 //! input, framed and then raw, goes over one connection in chunks the input's hash picks, and
-//! the stream invariants of `Loopback.checkStream` must hold (review A17).
+//! the stream invariants of `Loopback.checkStream` must hold (review A17, B4). TCP uses a
+//! separate counting allocator because the server survives runs: its memory bound includes
+//! live bytes at entry plus all allocations during the stream, including the oracle itself.
 //!
 //! The `forward` target drives a fake UDP/TCP upstream through the real server, mutating raw
 //! responses and matching messages: ID/question/source checks, TC twice, short TCP frames,
@@ -55,13 +57,15 @@ pub const Fixture = struct {
     peak: usize = 0,
     /// The `tcp` target's server, started on first use.
     loopback: ?*server.Loopback = null,
+    tcp_memory: std.testing.FailingAllocator,
+    peak_tcp_bytes: usize = 0,
     stream: [2 * max_packet + 2]u8 = undefined,
     forward_probe: ?server.ForwardProbe = null,
 
     pub fn init(gpa: Allocator) !*Fixture {
         const f = try gpa.create(Fixture);
         errdefer gpa.destroy(f);
-        f.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .zones = undefined, .overlay = update.Overlay.init(gpa, 120, 3600), .fba = undefined };
+        f.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .zones = undefined, .overlay = update.Overlay.init(gpa, 120, 3600), .fba = undefined, .tcp_memory = .init(gpa, .{}) };
         errdefer f.arena.deinit();
         const a = f.arena.allocator();
         f.fba = std.heap.FixedBufferAllocator.init(try a.alloc(u8, 2 * max_request_bytes));
@@ -119,6 +123,14 @@ pub const Fixture = struct {
                 .{ .name = ch, .type = .txt, .class = .any },
             },
         });
+        // IDs make the outer framed copy a response (ignored), leaving 101 raw queries.
+        var stream: [101 * 19]u8 = undefined;
+        for (0..101) |id| {
+            const frame = stream[id * 19 ..][0..19];
+            std.mem.writeInt(u16, frame[0..2], 17, .big);
+            _ = try (wire.Message{ .id = @intCast(0x8000 + id), .question = &.{.{ .name = "\x00", .type = .a }} }).encode(frame[2..]);
+        }
+        try f.seeds.append(f.arena.allocator(), try f.arena.allocator().dupe(u8, &stream));
     }
 
     fn seed(f: *Fixture, m: wire.Message) !void {
@@ -136,7 +148,14 @@ pub const Fixture = struct {
             .respond => try f.respond(a, packet),
             .update => try f.applyUpdate(a, packet),
             .@"update-state" => try f.updateState(a, packet),
-            .tcp => try f.tcp(packet),
+            .tcp => {
+                const freed = f.tcp_memory.freed_bytes;
+                const result = f.tcp(packet);
+                const bytes = f.tcp_memory.allocated_bytes - freed;
+                f.peak_tcp_bytes = @max(f.peak_tcp_bytes, bytes);
+                if (bytes > max_request_bytes) return error.Memory;
+                try result;
+            },
             .forward => {
                 if (f.forward_probe == null) f.forward_probe = server.ForwardProbe.init(f.gpa) catch return error.Stream;
                 var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(17, packet));
@@ -191,7 +210,7 @@ pub const Fixture = struct {
     }
 
     fn tcp(f: *Fixture, packet: []const u8) Finding!void {
-        const l = f.loopback orelse (server.Loopback.init(f.gpa, .{}) catch return error.Stream);
+        const l = f.loopback orelse (server.Loopback.init(f.tcp_memory.allocator(), .{}) catch return error.Stream);
         f.loopback = l;
         // shortcut: one connection per 3 ms stays under the ephemeral ports that TIME_WAIT holds
         // (about 16k for 30 s on macOS, 28k for 60 s on Linux); a faster loop runs out and fails to connect.
@@ -455,10 +474,25 @@ pub fn main(init: std.process.Init) !void {
         };
         iterations.store(n + 1, .monotonic);
     }
-    std.debug.print("fuzz: done target={s} seed={d} iterations={d} peak_request_bytes={d}\n", .{ @tagName(target), seed, iterations.load(.monotonic), f.peak });
+    std.debug.print("fuzz: done target={s} seed={d} iterations={d} peak_request_bytes={d} peak_tcp_bytes={d}\n", .{ @tagName(target), seed, iterations.load(.monotonic), f.peak, f.peak_tcp_bytes });
 }
 
 // ---- corpus replay -----------------------------------------------------------------------------
+
+test "TCP fuzzing charges server allocations to its memory oracle (review B4)" {
+    const f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    // Fail before opening sockets: initialization must use this allocator, not the GPA.
+    f.tcp_memory.fail_index = 0;
+    try std.testing.expectError(error.Stream, f.run(.tcp, ""));
+    try std.testing.expect(f.tcp_memory.has_induced_failure);
+    f.tcp_memory.fail_index = std.math.maxInt(usize);
+    const excess = try f.tcp_memory.allocator().alloc(u8, max_request_bytes + 1);
+    defer f.tcp_memory.allocator().free(excess);
+    f.tcp_memory.fail_index = f.tcp_memory.alloc_index;
+    try std.testing.expectError(error.Memory, f.run(.tcp, ""));
+    try std.testing.expect(f.peak_tcp_bytes > max_request_bytes);
+}
 
 test "the fuzz corpus and every seed replay through every target" {
     const f = try Fixture.init(std.testing.allocator);

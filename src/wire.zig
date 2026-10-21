@@ -76,9 +76,7 @@ pub const Message = struct {
     tsig_at: ?usize = null,
 
     pub fn parse(a: Allocator, packet: []const u8) ParseError!Message {
-        // One pointer hop per packet byte (review A1): names re-walking a chain of pointers would
-        // otherwise cost quadratic work in a packet that is small and valid.
-        var r: Reader = .{ .buf = packet, .hops = packet.len };
+        var r: Reader = .{ .buf = packet };
         var m: Message = .{};
         m.id = try r.int(u16);
         m.flags = @bitCast(try r.int(u16));
@@ -88,6 +86,9 @@ pub const Message = struct {
         const ar = try r.int(u16);
         // A question is at least 5 bytes and an RR 11: refuse a lying header before allocating.
         if (@as(usize, qd) * 5 + (@as(usize, an) + ns + ar) * 11 > packet.len - r.pos) return error.Malformed;
+        // Amortize 64 hops per possible name (owner + at most two RDATA names per RR).
+        // This admits ordinary backward chains while bounding total work linearly (A1, B1).
+        r.hops = 64 * (@as(usize, qd) + 3 * (@as(usize, an) + ns + ar));
         const qs = try a.alloc(Question, qd);
         for (qs) |*q| q.* = .{ .name = try parseName(a, &r), .type = @enumFromInt(try r.int(u16)), .class = @enumFromInt(try r.int(u16)) };
         m.question = qs;
@@ -128,6 +129,38 @@ pub const Message = struct {
         return found;
     }
 };
+
+/// Recover EDNS for an early question-count FORMERR without allocating or expanding questions.
+/// Only encoded name boundaries are walked; the OPT itself still gets normal EDNS validation.
+pub fn findOpt(packet: []const u8) error{Malformed}!?Opt {
+    if (packet.len < 12) return error.Malformed;
+    var r: Reader = .{ .buf = packet, .pos = 4 };
+    const qd = try r.int(u16);
+    const counts = [_]u16{ try r.int(u16), try r.int(u16), try r.int(u16) };
+    for (0..qd) |_| {
+        try r.skipName();
+        _ = try r.take(4);
+    }
+    var found: ?Opt = null;
+    for (counts, 0..) |count, section| for (0..count) |_| {
+        const owner = r.pos;
+        try r.skipName();
+        const end = r.pos;
+        const t: Type = @enumFromInt(try r.int(u16));
+        const class: Class = @enumFromInt(try r.int(u16));
+        const ttl = try r.int(u32);
+        const raw = try r.take(try r.int(u16));
+        if (t == .opt) {
+            if (section != 2 or found != null) return error.Malformed;
+            var name_reader: Reader = .{ .buf = packet[0..end], .pos = owner, .hops = packet.len };
+            var name: [255]u8 = undefined;
+            const rr: RR = .{ .name = try name_reader.name(&name), .type = t, .class = class, .ttl = ttl, .rdata = raw };
+            found = try (Message{ .additional = &.{rr} }).edns();
+        }
+    };
+    if (r.pos != packet.len) return error.Malformed;
+    return found;
+}
 
 /// Presentation form to wire form, case kept; "." is the root.
 pub fn nameFromText(out: *[255]u8, text: []const u8) error{Malformed}![]const u8 {
@@ -188,6 +221,27 @@ pub const Reader = struct {
     pub fn int(r: *Reader, comptime T: type) error{Malformed}!T {
         const n = @divExact(@bitSizeOf(T), 8);
         return std.mem.readInt(T, (try r.take(n))[0..n], .big);
+    }
+
+    fn skipName(r: *Reader) error{Malformed}!void {
+        const start = r.pos;
+        while (true) {
+            const pos = r.pos;
+            const c = (try r.take(1))[0];
+            switch (c & 0xC0) {
+                0 => {
+                    _ = try r.take(c);
+                    if (r.pos - start > 255) return error.Malformed;
+                    if (c == 0) return;
+                },
+                0xC0 => {
+                    const target = @as(usize, c & 0x3F) << 8 | (try r.take(1))[0];
+                    if (target >= pos) return error.Malformed;
+                    return;
+                },
+                else => return error.Malformed,
+            }
+        }
     }
 
     /// Reads a possibly compressed name into `out`. Every pointer must point strictly before
@@ -684,4 +738,46 @@ test "chained compression pointers run out of the per-packet budget (review A1)"
     // A short chain is ordinary compression and still parses.
     const short = try Message.parse(arena.allocator(), pointerChain(buf, 20, 6));
     try testing.expectEqual(@as(usize, 20), short.answer.len);
+}
+
+test "40 chained A owners fit the compression budget (review B1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [657]u8 = undefined;
+    const packet = pointerChain(&buf, 40, 6); // 820 hops, but only 657 bytes
+    try testing.expectEqual(@as(usize, 657), packet.len);
+    const m = try Message.parse(arena.allocator(), packet);
+    try testing.expectEqual(@as(usize, 40), m.answer.len);
+    for (m.answer) |rr| {
+        try testing.expectEqualSlices(u8, "\x00", rr.name);
+        try testing.expectEqualSlices(u8, "\x7f\x00\x00\x01", rr.rdata);
+    }
+}
+
+test "early OPT recovery validates boundaries, placement and options (review B2)" {
+    var buf: [512]u8 = undefined;
+    const q: Question = .{ .name = wn("example.org."), .type = .a };
+    const opt = (Opt{ .payload = 1232, .options = "\xfd\xe8\x00\x02ok" }).toRR();
+    const m: Message = .{
+        .question = &.{ q, q },
+        .answer = &.{.{ .name = q.name, .type = .a, .rdata = "\x7f\x00\x00\x01" }},
+        .authority = &.{.{ .name = q.name, .type = .ns, .rdata = q.name }},
+        .additional = &.{opt},
+    };
+    const n = try m.encode(&buf);
+    try testing.expectEqual(@as(u16, 1232), (try findOpt(buf[0..n])).?.payload);
+    for (0..n) |cut| try testing.expectError(error.Malformed, findOpt(buf[0..cut]));
+    buf[n] = 0;
+    try testing.expectError(error.Malformed, findOpt(buf[0 .. n + 1]));
+    var owned = opt;
+    owned.name = q.name;
+    var bad_options = opt;
+    bad_options.rdata = "\xfd\xe8\x00\x03ok";
+    for ([_]Message{
+        .{ .answer = &.{opt} },
+        .{ .authority = &.{opt} },
+        .{ .additional = &.{ opt, opt } },
+        .{ .additional = &.{owned} },
+        .{ .additional = &.{bad_options} },
+    }) |bad| try testing.expectError(error.Malformed, findOpt(buf[0..try bad.encode(&buf)]));
 }

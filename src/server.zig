@@ -33,7 +33,7 @@ const max_messages_per_conn = 100;
 const max_conns = 64;
 /// Total time an answer may wait for a slow reader before the connection is closed (review A2).
 const write_timeout_ms = 5_000;
-/// Answer bytes kept for one connection: one local answer plus forwarded ones in flight.
+/// Answer bytes kept for one connection; forwarding admission reserves a whole response.
 const max_pending_output = 2 * (2 + max_message);
 const backlog = 128;
 const max_pending = 256;
@@ -56,6 +56,8 @@ const Conn = struct {
     /// Answer bytes the socket has not taken yet, sent on write readiness; no new frame is
     /// read meanwhile, so a slow reader stalls its own connection only (review A2).
     pending: std.ArrayList(u8) = .empty,
+    /// Reads pause while one forwarded response is outstanding (review B3).
+    waiting: bool = false,
     /// The client shut its write half: what it asked is still answered, then the connection
     /// closes (review A16).
     eof: bool = false,
@@ -411,8 +413,20 @@ pub const Server = struct {
             s.deliver(w.to, s.out[2 .. 2 + n]);
             _ = s.arena.reset(.retain_capacity);
         }
-        // A client that already sent its EOF may now be owed nothing more.
-        for (waiters.items) |w| if (w.to == .tcp) if (s.conn(w.to.tcp.token, w.to.tcp.gen)) |c| if (c.eof) s.settle(w.to.tcp.token);
+        for (waiters.items) |w| if (w.to == .tcp) if (s.conn(w.to.tcp.token, w.to.tcp.gen)) |c| {
+            if (c.eof) {
+                s.settle(w.to.tcp.token);
+            } else if (c.waiting) {
+                c.waiting = false;
+                if (c.pending.items.len == 0) {
+                    s.poller.set(c.fd, w.to.tcp.token, .read) catch {
+                        s.close(w.to.tcp.token);
+                        continue;
+                    };
+                    s.frames(w.to.tcp.token, c);
+                }
+            }
+        };
     }
 
     /// The connection in slot `token` if it is still generation `gen`.
@@ -468,6 +482,7 @@ pub const Server = struct {
 
     fn serveTcp(s: *Server, token: usize, c: *Conn) void {
         if (c.pending.items.len > 0) return s.flush(token, c);
+        if (c.waiting) return;
         if (c.eof) return s.close(token); // a hangup or an error: nothing more can be sent
         const rc = sys.recvfrom(c.fd, c.buf[c.len..].ptr, c.buf.len - c.len, 0, null, null);
         switch (posix.errno(rc)) {
@@ -488,6 +503,12 @@ pub const Server = struct {
     /// Answers the complete frames read so far, while the socket takes the answers.
     fn frames(s: *Server, token: usize, c: *Conn) void {
         while (c.pending.items.len == 0) {
+            // A forwarded reply can fill the output queue even after read readiness is paused.
+            if (s.awaited(token, c.gen)) {
+                c.waiting = true;
+                s.poller.set(c.fd, token, .none) catch s.close(token);
+                return;
+            }
             const end = frameEnd(c.buf[0..c.len]) orelse return;
             c.messages += 1;
             if (c.messages > max_messages_per_conn) return s.close(token);
@@ -914,13 +935,13 @@ pub const Loopback = struct {
     pub fn checkStream(l: *Loopback, stream: []const u8, rand: std.Random) error{Stream}!void {
         var want: [max_messages_per_conn]u16 = undefined;
         var n_want: usize = 0;
-        var capped = false;
+        var cap_at = stream.len;
         var rest = stream;
         var frames_seen: usize = 0;
         while (frameEnd(rest)) |end| : (rest = rest[end..]) {
             frames_seen += 1;
             if (frames_seen > max_messages_per_conn) {
-                capped = true;
+                cap_at = stream.len - rest.len;
                 break;
             }
             const msg = rest[2..end];
@@ -933,21 +954,26 @@ pub const Loopback = struct {
         defer _ = sys.close(fd);
         var got: std.ArrayList(u8) = .empty;
         defer got.deinit(l.gpa);
+        var arena = std.heap.ArenaAllocator.init(l.gpa);
+        defer arena.deinit();
+        var received: usize = 0;
         var sent: usize = 0;
         var shut = false;
         var turns: usize = 0;
         var buf: [16384]u8 = undefined;
         while (true) : (turns += 1) {
             if (turns > 100_000) return error.Stream; // the server never closed the connection
-            if (sent < stream.len) {
-                const chunk = 1 + rand.uintLessThan(usize, @min(stream.len - sent, 4096));
+            // Drain and validate the first 100 answers before frame 101 can cause a reset.
+            const send_end = if (received < n_want) cap_at else stream.len;
+            if (sent < send_end) {
+                const chunk = 1 + rand.uintLessThan(usize, @min(send_end - sent, 4096));
                 const rc = sys.sendto(fd, stream[sent..].ptr, chunk, 0, null, 0);
                 switch (posix.errno(rc)) {
                     .SUCCESS => sent += @intCast(rc),
                     .AGAIN, .INTR, .NOTCONN => {},
                     else => sent = stream.len, // the server closed it (message cap)
                 }
-            } else if (!shut) {
+            } else if (sent == stream.len and !shut) {
                 _ = sys.shutdown(fd, posix.SHUT.WR);
                 shut = true;
             }
@@ -956,23 +982,53 @@ pub const Loopback = struct {
             switch (posix.errno(rc)) {
                 .SUCCESS => if (rc == 0) break else got.appendSlice(l.gpa, buf[0..@intCast(rc)]) catch return error.Stream,
                 .AGAIN, .INTR => {},
-                else => if (capped) break else return error.Stream, // a reset: unread input at close
+                else => if (cap_at < stream.len) break else return error.Stream, // unread input at the cap
             }
+            const consumed = try checkAnswers(&arena, got.items, want[0..n_want], &received, false);
+            got.replaceRangeAssumeCapacity(0, consumed, &.{});
         }
-        var answers: []const u8 = got.items;
-        var i: usize = 0;
-        var arena = std.heap.ArenaAllocator.init(l.gpa);
-        defer arena.deinit();
-        while (frameEnd(answers)) |end| : (answers = answers[end..]) {
-            const m = wire.Message.parse(arena.allocator(), answers[2..end]) catch return error.Stream;
-            if (i == n_want or !m.flags.qr or m.id != want[i]) return error.Stream;
-            i += 1;
-        }
-        // A reset may cut what the cap left in flight; otherwise every answer is there, whole.
-        if (!capped and (i != n_want or answers.len != 0)) return error.Stream;
+        _ = try checkAnswers(&arena, got.items, want[0..n_want], &received, true);
         if (l.conns() != 0) return error.Stream;
     }
 };
+
+/// Consumes complete replies incrementally; EOF must leave every expected ID and no trailing bytes.
+fn checkAnswers(arena: *std.heap.ArenaAllocator, bytes: []const u8, want: []const u16, received: *usize, eof: bool) error{Stream}!usize {
+    var rest = bytes;
+    while (frameEnd(rest)) |end| : (rest = rest[end..]) {
+        defer _ = arena.reset(.retain_capacity);
+        const m = wire.Message.parse(arena.allocator(), rest[2..end]) catch return error.Stream;
+        if (received.* == want.len or !m.flags.qr or m.id != want[received.*]) return error.Stream;
+        received.* += 1;
+    }
+    if (eof and (received.* != want.len or rest.len != 0)) return error.Stream;
+    return bytes.len - rest.len;
+}
+
+test "TCP reply oracle requires all 100 ordered answers and no trailing bytes (review B4)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var want: [100]u16 = undefined;
+    var replies: [100 * 14]u8 = undefined;
+    for (&want, 0..) |*id, i| {
+        id.* = @intCast(i);
+        const frame = replies[i * 14 ..][0..14];
+        std.mem.writeInt(u16, frame[0..2], 12, .big);
+        _ = try (wire.Message{ .id = id.*, .flags = .{ .qr = true } }).encode(frame[2..]);
+    }
+    for ([_]usize{ 0, 14, replies.len - 1 }) |len| {
+        var received: usize = 0;
+        try testing.expectError(error.Stream, checkAnswers(&arena, replies[0..len], &want, &received, true));
+    }
+    var received: usize = 0;
+    _ = try checkAnswers(&arena, &replies, &want, &received, true);
+    try testing.expectEqual(@as(usize, 100), received);
+    try testing.expectError(error.Stream, checkAnswers(&arena, "\x00", &want, &received, true));
+    try testing.expectError(error.Stream, checkAnswers(&arena, replies[0..14], &want, &received, true));
+    received = 0;
+    std.mem.writeInt(u16, replies[2..4], 1, .big);
+    try testing.expectError(error.Stream, checkAnswers(&arena, &replies, &want, &received, true));
+}
 
 fn clientSocket(addr: net.IpAddress, kind: u32) !posix.fd_t {
     return socket(addr, kind);
@@ -1069,6 +1125,71 @@ test "the TCP connection cap is 64 with and without the metrics listener (review
         for (0..4 * clients.len) |_| try l.server.step(0);
         try testing.expectEqual(@as(usize, max_conns), l.conns());
     }
+}
+
+test "three maximum forwarded replies drain an unwritable TCP connection without overflow (review B3)" {
+    const any = try net.IpAddress.parse("127.0.0.1", 0);
+    const up = try open(any, posix.SOCK.DGRAM);
+    defer _ = sys.close(up);
+    const upstream = try net.IpAddress.parse("127.0.0.1", localPort(up));
+    const l = try Loopback.init(testing.allocator, .{ .forwarding = .{ .upstreams = &.{upstream} } });
+    defer l.deinit();
+    const fd = try l.connect();
+    defer _ = sys.close(fd);
+    for (0..1000) |_| {
+        try l.server.step(0);
+        if (l.conns() == 1) break;
+    }
+    try testing.expectEqual(@as(usize, 1), l.conns());
+    const s = l.server;
+    const token = s.first_conn;
+    const c = &s.slots[token].conn;
+    const small = std.mem.toBytes(@as(c_int, 4096));
+    try posix.setsockopt(c.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &small);
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &small);
+    // Fill the kernel buffer first; the client deliberately reads nothing until completion.
+    const padding: [16384]u8 = @splat(0);
+    var padded: usize = 0;
+    for (0..1024) |_| {
+        const n = sendSome(c.fd, &padding) orelse return error.Closed;
+        padded += n;
+        if (n == 0) break;
+    } else return error.StillWritable;
+    for (0..3) |id| c.len += queryFrame(c.buf[c.len..], @intCast(id), ".", .a).len;
+    s.frames(token, c);
+    // Before B3 all three waiters joined one completion batch, which could overflow pending.
+    try testing.expectEqual(@as(u32, 1), c.messages);
+    try testing.expect(c.waiting);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var packet: [max_message]u8 = undefined;
+    const rdata: [max_message - 28]u8 = @splat(0); // root question (17) + root RR header (11)
+    const response: wire.Message = .{
+        .flags = .{ .qr = true },
+        .question = &.{.{ .name = "\x00", .type = .a }},
+        .answer = &.{.{ .name = "\x00", .type = @enumFromInt(65280), .rdata = &rdata }},
+    };
+    const len = try response.encode(&packet);
+    try testing.expectEqual(@as(usize, max_message), len);
+    for (0..3) |id| {
+        const pending = for (s.pending, 0..) |p, i| {
+            if (p != null) break i;
+        } else return error.NoPendingQuery;
+        try testing.expectEqual(@as(usize, 1), s.pending[pending].?.waiters.items.len);
+        s.complete(pending, &packet);
+        try testing.expectEqual(@as(usize, 1), l.conns());
+        try testing.expect(c.pending.items.len <= max_pending_output);
+        if (id == 0) try testing.expect(c.pending.items.len > 0);
+        try testing.expect(try readSome(l, fd, &got, padded + (id + 1) * (2 + max_message)));
+        const start = padded + id * (2 + max_message);
+        try testing.expectEqual(@as(u16, max_message), std.mem.readInt(u16, got.items[start..][0..2], .big));
+        try testing.expectEqual(@as(u16, @intCast(id)), std.mem.readInt(u16, got.items[start + 2 ..][0..2], .big));
+    }
+    try testing.expectEqual(padded + 3 * (2 + max_message), got.items.len);
+    try testing.expectEqual(@as(u32, 3), c.messages);
+    _ = sys.shutdown(fd, posix.SHUT.WR);
+    try testing.expect(!try readSome(l, fd, &got, got.items.len + 1));
+    try testing.expectEqual(@as(usize, 0), l.conns());
 }
 
 test "a TCP client's EOF does not drop the forwarded answer it is owed (review A16)" {

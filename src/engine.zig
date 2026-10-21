@@ -65,8 +65,11 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
         .now = ctx.now,
         .arena = arena,
     };
-    // Exactly one question (RFC 9619), checked before decoding anything (review A1).
-    if (std.mem.readInt(u16, query[4..6], .big) != 1) return r.finish(id, out, .formerr);
+    // Reject before expanding questions (A1), but echo a structurally valid OPT (B2).
+    if (std.mem.readInt(u16, query[4..6], .big) != 1) {
+        if (wire.findOpt(query) catch null) |_| r.opt = .{ .payload = @min(out.len, max_udp_payload) };
+        return r.finish(id, out, .formerr);
+    }
     const msg = wire.Message.parse(arena, query) catch |e| switch (e) {
         error.Malformed => return r.finish(id, out, .formerr),
         error.OutOfMemory => return r.finish(id, out, .servfail),
@@ -750,6 +753,25 @@ test "a question count other than one is FORMERR before anything is decoded (rev
     // One question but a chain on the answer owners: the parser's hop budget refuses it.
     const owners = try f.reply(wire.pointerChain(&f.buf, 4000, 6), .tcp);
     try testing.expectEqual(Rcode.formerr, @as(Rcode, @enumFromInt(owners.flags.rcode)));
+}
+
+test "early question-count FORMERR echoes a valid OPT without allocation (review B2)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const q: wire.Question = .{ .name = "\x00", .type = .a };
+    for ([_][]const wire.Question{ &.{}, &.{ q, q } }) |questions| {
+        const request: wire.Message = .{ .id = 0x1234, .question = questions, .additional = &.{(wire.Opt{ .payload = 4096 }).toRR()} };
+        const len = try request.encode(&f.buf);
+        if (questions.len == 0) try testing.expectEqual(@as(usize, 23), len);
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        const n = respond(failing.allocator(), f.ctx, f.buf[0..len], &f.out, .udp, null).?;
+        const m = try wire.Message.parse(f.arena.allocator(), f.out[0..n]);
+        try testing.expectEqual(Rcode.formerr, @as(Rcode, @enumFromInt(m.flags.rcode)));
+        try testing.expectEqual(@as(u16, 0x1234), m.id);
+        try testing.expectEqual(@as(usize, 0), m.question.len);
+        try testing.expectEqual(@as(u16, max_udp_payload), (try m.edns()).?.payload);
+        try testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
 }
 
 test "every record of a 65-value RRset is served over TCP and EDNS, or TC is set (review A4)" {

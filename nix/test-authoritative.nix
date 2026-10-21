@@ -104,8 +104,8 @@ pkgs.testers.runNixOSTest {
               assert "status: NOERROR" in out and "ANSWER: 0" in out and re.search(r"IN\s+SOA", out), out
 
       with subtest("REFUSED outside the loaded zones and for UPDATE in uchi mode, NOTIMP for other opcodes"):
-          # Opcode 5 (UPDATE) is REFUSED on a uchi (ADR 0006); opcode 2 (STATUS) is not implemented.
-          for args, status in [("example.net A", "REFUSED"), ("org A", "REFUSED"), ("+opcode=5 hub.kekkai.uchi.example.org A", "REFUSED"), ("+opcode=2 hub.kekkai.uchi.example.org A", "NOTIMP")]:
+          # Opcode 5 (UPDATE) is REFUSED on a uchi (ADR 0006), opcode 4 (NOTIFY) everywhere (ADR 0007); opcode 2 (STATUS) is not implemented.
+          for args, status in [("example.net A", "REFUSED"), ("org A", "REFUSED"), ("+opcode=5 hub.kekkai.uchi.example.org A", "REFUSED"), ("+opcode=4 uchi.example.org SOA", "REFUSED"), ("+opcode=2 hub.kekkai.uchi.example.org A", "NOTIMP")]:
               out = q(f"+noall +comments {args}")
               assert f"status: {status}" in out, out
           out = server.succeed("journalctl _SYSTEMD_UNIT=annai.service -o cat --no-pager")

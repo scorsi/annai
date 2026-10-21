@@ -93,8 +93,14 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
         if (ctx.metrics) |m| m.update(ctx.keys, key, rc);
         return r.finish(id, out, rc);
     }
+    // ADR 0007/0009: no zone transfers, in any mode and for any name, so before the zone lookup and forwarding.
+    if (qflags.opcode == 4) return r.finish(id, out, .refused); // NOTIFY
     if (qflags.opcode != 0) return r.finish(id, out, .notimp);
     if (q.class != .in) return r.finish(id, out, .refused);
+    switch (@intFromEnum(q.type)) {
+        251, 252 => return r.finish(id, out, .refused), // IXFR, AXFR
+        else => {},
+    }
 
     var lowered: [255]u8 = undefined;
     @memcpy(lowered[0..q.name.len], q.name);
@@ -555,6 +561,33 @@ test "FORMERR for malformed packets and wrong question counts; no reply to repli
     try expectRcode(try f.reply(f.buf[0..try owned.encode(&f.buf)], .udp), .formerr);
     try testing.expectError(error.NoResponse, f.reply("\x12\x34\x81\x00\x00\x00\x00\x00\x00\x00\x00\x00", .udp));
     try testing.expectError(error.NoResponse, f.reply("\x12\x34\x01", .udp));
+}
+
+test "zone transfers are REFUSED (ADR 0007): AXFR and IXFR over UDP and TCP, NOTIFY, every mode and name" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    for ([_][]const u8{ "uchi.example.org.", "hub.kekkai.uchi.example.org.", "nope.uchi.example.org.", "example.net." }) |name| {
+        for ([_]u16{ 251, 252 }) |t| for ([_]Transport{ .udp, .tcp }) |transport| {
+            for ([_]bool{ false, true }) |soto| {
+                if (soto) f.soto(0) else f.ctx = .{ .zones = &f.zones };
+                const m = try f.ask(.{ .name = name, .type = @enumFromInt(t), .transport = transport });
+                try expectRcode(m, .refused);
+                try testing.expect(!m.flags.aa and m.question.len == 1 and m.answer.len == 0 and m.authority.len == 0);
+                try testing.expectEqual(@as(u16, t), @intFromEnum(m.question[0].type));
+            }
+            // uchi with forwarding on: refused, never handed to the upstream.
+            f.ctx = .{ .zones = &f.zones };
+            var nbuf: [255]u8 = undefined;
+            const q: wire.Message = .{ .id = 0x1234, .flags = .{ .rd = true }, .question = &.{.{ .name = try wire.nameFromText(&nbuf, name), .type = @enumFromInt(t) }} };
+            var fwd: ?Forward = null;
+            const n = respond(f.arena.allocator(), f.ctx, f.buf[0..try q.encode(&f.buf)], &f.out, transport, &fwd).?;
+            try testing.expect(fwd == null);
+            try testing.expectEqual(Rcode.refused, @as(Rcode, @enumFromInt((try wire.Message.parse(f.arena.allocator(), f.out[0..n])).flags.rcode)));
+        };
+        const notify = try f.ask(.{ .name = name, .type = .soa, .opcode = 4 });
+        try expectRcode(notify, .refused);
+        try testing.expect(notify.flags.opcode == 4 and notify.answer.len == 0 and notify.authority.len == 0);
+    }
 }
 
 test "forwarding: names outside the zones are handed over, answers get RA, the TTL and TC" {

@@ -11,6 +11,8 @@ const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const algorithm = "\x0bhmac-sha256\x00";
 pub const mac_len = Hmac.mac_length;
+/// The shortest truncated MAC RFC 8945 §5.2.2.1 allows for HMAC-SHA256: max(10, 32 / 2).
+pub const min_mac_len = mac_len / 2;
 
 pub const Error = enum(u16) { none = 0, badsig = 16, badkey = 17, badtime = 18 };
 
@@ -54,9 +56,11 @@ pub fn verify(keys: []const Key, packet: []const u8, m: wire.Message, now: i64) 
     const alg = try plainName(rr.rdata);
     r.pos = alg.len;
     var s: Status = .{ .key = null, .name = rr.name, .alg = alg, .time = try r.int(u48), .fudge = try r.int(u16), .original_id = 0, .mac = "", .err = .badkey };
-    // shortcut: no truncated MACs (RFC 8945 §5.2.2.1), BIND and miekg/dns send full ones; accept 16..32 if a client ever needs it.
-    if (try r.int(u16) != mac_len) return error.Malformed;
-    s.mac = try r.take(mac_len);
+    // RFC 8945 §5.2.2.1: longer than the hash or shorter than max(10, half the hash) is FORMERR.
+    // Local policy (§5.2.4) accepts every legal length, so BADTRUNC is never sent (review A7).
+    const size = try r.int(u16);
+    if (size > mac_len or size < min_mac_len) return error.Malformed;
+    s.mac = try r.take(size);
     s.original_id = try r.int(u16);
     const request_err = try r.int(u16);
     const other = try r.take(try r.int(u16));
@@ -79,7 +83,11 @@ pub fn verify(keys: []const Key, packet: []const u8, m: wire.Message, now: i64) 
     variables(&h, key.name, s.time, s.fudge, request_err, other);
     var mac: [mac_len]u8 = undefined;
     h.final(&mac);
-    if (!std.crypto.timing_safe.eql([mac_len]u8, mac, s.mac[0..mac_len].*)) {
+    // Only the sent prefix is compared, in constant time (the zeroed tails are equal).
+    var sent = [_]u8{0} ** mac_len;
+    @memcpy(sent[0..s.mac.len], s.mac);
+    @memset(mac[s.mac.len..], 0);
+    if (!std.crypto.timing_safe.eql([mac_len]u8, mac, sent)) {
         s.err = .badsig;
         return s;
     }
@@ -110,21 +118,37 @@ pub fn sign(s: Status, out: []u8, len: usize, now: i64) usize {
         h.final(&mac);
         mac_size = mac_len;
     }
+    return append(out, len, s.name, s.alg, time, s.fudge, mac[0..mac_size], s.original_id, @intFromEnum(s.err), other[0..other_len]);
+}
+
+/// Signs the request `out[0..len]` with `key` at `time`, keeping the first `mac_size` bytes of the
+/// MAC, and returns the new length: what a client such as hanko sends (tests and the fuzzer).
+pub fn signRequest(key: Key, out: []u8, len: usize, time: u48, mac_size: usize) usize {
+    var h = Hmac.init(key.secret);
+    h.update(out[0..len]);
+    variables(&h, key.name, time, 300, 0, "");
+    var mac: [mac_len]u8 = undefined;
+    h.final(&mac);
+    return append(out, len, key.name, algorithm, time, 300, mac[0..mac_size], std.mem.readInt(u16, out[0..2], .big), 0, "");
+}
+
+/// Appends a TSIG RR (owner uncompressed) to `out[0..len]` and bumps ARCOUNT.
+fn append(out: []u8, len: usize, name: []const u8, alg: []const u8, time: u48, fudge: u16, mac: []const u8, original_id: u16, err: u16, other: []const u8) usize {
     var w: Appender = .{ .buf = out, .len = len };
-    w.bytes(s.name);
+    w.bytes(name);
     w.int(u16, @intFromEnum(wire.Type.tsig));
     w.int(u16, @intFromEnum(wire.Class.any));
     w.int(u32, 0);
-    w.int(u16, @intCast(s.alg.len + 16 + mac_size + other_len));
-    w.bytes(s.alg);
+    w.int(u16, @intCast(alg.len + 16 + mac.len + other.len));
+    w.bytes(alg);
     w.int(u48, time);
-    w.int(u16, s.fudge);
-    w.int(u16, @intCast(mac_size));
-    w.bytes(mac[0..mac_size]);
-    w.int(u16, s.original_id);
-    w.int(u16, @intFromEnum(s.err));
-    w.int(u16, @intCast(other_len));
-    w.bytes(other[0..other_len]);
+    w.int(u16, fudge);
+    w.int(u16, @intCast(mac.len));
+    w.bytes(mac);
+    w.int(u16, original_id);
+    w.int(u16, err);
+    w.int(u16, @intCast(other.len));
+    w.bytes(other);
     std.mem.writeInt(u16, out[10..12], std.mem.readInt(u16, out[10..12], .big) + 1, .big);
     return w.len;
 }
@@ -182,6 +206,8 @@ pub const vector = struct {
     pub const update = "6cb328000001000000010001076578616d706c65036f726700000600010f5f61636d652d6368616c6c656e6765036769740475636869c00c001000010000003c000504746f6b310568616e6b6f0000fa00ff00000000003d0b686d61632d7368613235360000006ad473fd012c0020dcebc399984f10a0666800f4a943f883faa152c3d028321381c7349dba7576046cb300000000";
     /// A NOERROR response (QR, opcode 5, the zone echoed) signed at `time`.
     pub const response_mac = "da8dcb317617b507f56dea13bacc8e99cc25f6be6f1cdd7b8bfec675c00ccb66";
+    /// The NOERROR response to the same request signed with its MAC truncated to 16 bytes.
+    pub const truncated_response_mac = "ee87d98f5db16dd2c17ebcf8597512407d777b7575e35b497766ed4aae62619e";
     /// The same with rcode NOTAUTH, error BADTIME and our time (`time` + 1000) in Other Data.
     pub const badtime_mac = "b11acc97eca352aa9d768c7e47c2b03020186342ce143dfb902d3a60edd01d9d";
 
@@ -219,11 +245,51 @@ test "verify BIND's request: ok, BADTIME outside the fudge, BADSIG, BADKEY, FORM
     const rr = m.additional[0];
     const moved: wire.Message = .{ .additional = &.{ rr, (wire.Opt{ .payload = 512 }).toRR() } };
     try testing.expectError(error.Malformed, verify(&keys, pkt, moved, vector.time));
-    // A truncated MAC size.
-    var short = rr;
-    short.rdata = rr.rdata[0..30];
-    const trunc: wire.Message = .{ .additional = &.{short}, .tsig_at = m.tsig_at };
-    try testing.expectError(error.Malformed, verify(&keys, pkt, trunc, vector.time));
+}
+
+test "truncated MACs (RFC 8945 §5.2.2.1): 16 to 32 bytes verify, shorter or longer is FORMERR (review A7)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var vbuf: [256]u8 = undefined;
+    const pkt = vector.packet(&vbuf);
+    const keys = [_]Key{vector.key};
+    const bare = pkt.len - 78;
+    var buf: [256]u8 = undefined;
+    for ([_]usize{ 0, 1, 10, 15, 16, 17, 31, 32, 33 }) |size| {
+        @memcpy(buf[0..bare], pkt[0..bare]);
+        buf[11] = 0;
+        var len = signRequest(vector.key, &buf, bare, vector.time, @min(size, mac_len));
+        if (size == mac_len) try testing.expectEqualSlices(u8, pkt, buf[0..len]); // BIND's own request
+        if (size > mac_len) { // one byte more than the hash: MAC Size and RDLENGTH grow, a byte is inserted
+            const at = len - 6;
+            std.mem.copyBackwards(u8, buf[at + 1 .. len + 1], buf[at..len]);
+            buf[at] = 0;
+            len += 1;
+            buf[bare + 16] += 1; // RDLENGTH (low byte): after the owner (7 bytes), type, class and TTL
+            buf[bare + 17 + 21] += 1; // MAC Size (low byte): after the algorithm (13), time and fudge
+        }
+        const m = try wire.Message.parse(arena.allocator(), buf[0..len]);
+        if (size < min_mac_len or size > mac_len) {
+            try testing.expectError(error.Malformed, verify(&keys, buf[0..len], m, vector.time));
+            continue;
+        }
+        const s = (try verify(&keys, buf[0..len], m, vector.time)).?;
+        try testing.expect(s.err == .none and s.mac.len == size);
+        buf[len - 7] ^= 1; // the last MAC byte sent
+        try testing.expectEqual(Error.badsig, (try verify(&keys, buf[0..len], m, vector.time)).?.err);
+    }
+    // The response digest starts with the truncated request MAC (Python oracle); ours is full length.
+    @memcpy(buf[0..bare], pkt[0..bare]);
+    buf[11] = 0;
+    const len = signRequest(vector.key, &buf, bare, vector.time, 16);
+    const s = (try verify(&keys, buf[0..len], try wire.Message.parse(arena.allocator(), buf[0..len]), vector.time)).?;
+    var out: [512]u8 = undefined;
+    const response = "\x6c\xb3\xa8\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03org\x00\x00\x06\x00\x01";
+    @memcpy(out[0..response.len], response);
+    const n = sign(s, &out, response.len, vector.time);
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, vector.truncated_response_mac);
+    try testing.expectEqualSlices(u8, &want, out[n - 38 .. n - 6]);
 }
 
 test "sign: the NOERROR response and the signed BADTIME response match the Python oracle" {

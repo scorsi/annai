@@ -9,7 +9,12 @@
 //! input, framed and then raw, goes over one connection in chunks the input's hash picks, and
 //! the stream invariants of `Loopback.checkStream` must hold (review A17).
 //!
-//! By hand: `zig build fuzz -- <codec|respond|update|tcp> <seconds> [seed]` (or `nix run .#fuzz`, in
+//! The `update-state` target builds a signed UPDATE from the input's hash (so mutations never
+//! break the MAC) and sends it through `engine.respond`, sometimes over a nearly full overlay or
+//! with a failing allocation: a non-NOERROR answer must leave the overlay exactly as it was, and
+//! the overlay must keep the ADR 0006 policy and valid RRsets (review A3, A8, A17).
+//!
+//! By hand: `zig build fuzz -- <codec|respond|update|update-state|tcp> <seconds> [seed]` (or `nix run .#fuzz`, in
 //! ReleaseSafe); findings are `fuzz: ...` lines on stderr. Every finding becomes a line of
 //! src/corpus/fuzz.txt, which `zig build test` replays through every target.
 
@@ -23,13 +28,13 @@ const config = @import("config.zig");
 const server = @import("server.zig");
 const Allocator = std.mem.Allocator;
 
-pub const Target = enum { codec, respond, update, tcp };
+pub const Target = enum { codec, respond, update, @"update-state", tcp };
 
 /// Per-request memory a message of at most 64 KiB may take; more is a finding.
 pub const max_request_bytes = 8 << 20;
 const max_packet = 65535;
 
-pub const Finding = error{ Encode, Reparse, RoundTrip, Oversize, IdLost, NotResponse, Memory, Overflow, Stream };
+pub const Finding = error{ Encode, Reparse, RoundTrip, Oversize, IdLost, NotResponse, Memory, Overflow, Stream, Atomicity, Unsigned, Invariant };
 
 pub const Fixture = struct {
     gpa: Allocator,
@@ -123,6 +128,7 @@ pub const Fixture = struct {
             .codec => try f.codec(a, packet),
             .respond => try f.respond(a, packet),
             .update => try f.applyUpdate(a, packet),
+            .@"update-state" => try f.updateState(a, packet),
             .tcp => try f.tcp(packet),
         }
         if (f.fba.end_index > max_request_bytes) return error.Memory;
@@ -181,6 +187,36 @@ pub const Fixture = struct {
         try l.checkStream(f.stream[0 .. 2 + 2 * n], prng.random());
     }
 
+    fn updateState(f: *Fixture, a: Allocator, input: []const u8) Finding!void {
+        var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(1, input));
+        const rand = prng.random();
+        const o = &f.overlay;
+        if (o.records.items.len > 900 and rand.boolean()) o.expire(std.math.maxInt(i64));
+        if (rand.uintLessThan(u8, 8) == 0) fill(o, f.gpa, update.max_records - rand.uintAtMost(usize, 3));
+        const m: wire.Message = .{
+            .id = rand.int(u16),
+            .flags = .{ .opcode = 5 },
+            .question = &.{.{ .name = pick(rand, []const u8, &.{ "\x07example\x03org\x00", "\x07example\x03org\x00", "\x07example\x03net\x00" }), .type = .soa }},
+            .answer = try randomRRs(a, rand, 3, true),
+            .authority = try randomRRs(a, rand, 5, false),
+        };
+        const n = m.encode(&f.stream) catch return;
+        const len = tsig.signRequest(tsig.vector.key, &f.stream, n, tsig.vector.time, rand.intRangeAtMost(usize, tsig.min_mac_len, tsig.mac_len));
+        const before = try snapshot(a, o);
+        // Now and then an allocation of the overlay fails, at any point of the transaction.
+        var failing = std.testing.FailingAllocator.init(f.gpa, .{ .fail_index = if (rand.uintLessThan(u8, 4) == 0) rand.uintLessThan(usize, 8) else std.math.maxInt(usize) });
+        o.gpa = failing.allocator();
+        defer o.gpa = f.gpa;
+        const ctx: engine.Context = .{ .zones = f.zones[1..2], .keys = &f.keys, .overlay = o, .now = tsig.vector.time, .mono = 1000 };
+        const out = engine.respond(a, ctx, f.stream[0..len], &f.out, .tcp, null) orelse return error.NotResponse;
+        try f.check(a, out, .tcp, f.stream[0..2]);
+        const reply = wire.Message.parse(a, f.out[0..out]) catch return error.Reparse;
+        const rcode: wire.Rcode = @enumFromInt(reply.flags.rcode);
+        if (rcode != .formerr and reply.tsig_at == null) return error.Unsigned;
+        if (rcode != .noerror and !unchanged(before, o)) return error.Atomicity;
+        if (!invariants(&f.zones[1], o)) return error.Invariant;
+    }
+
     fn applyUpdate(f: *Fixture, a: Allocator, packet: []const u8) Finding!void {
         const m = wire.Message.parse(a, packet) catch return;
         if (m.question.len != 1) return;
@@ -190,6 +226,78 @@ pub const Fixture = struct {
         if (f.overlay.records.items.len > 900) f.overlay.expire(std.math.maxInt(i64));
     }
 };
+
+// ---- update-state ------------------------------------------------------------------------------
+
+const ch_label = "\x0f_acme-challenge";
+/// UPDATE owners: plain, nested (its parent becomes an empty non-terminal), the apex, beside a
+/// static TXT, at a static CNAME, outside the policy, mixed case, outside the zone.
+const owners = [_][]const u8{
+    ch_label ++ "\x03git\x07example\x03org\x00",
+    ch_label ++ ch_label ++ "\x03git\x07example\x03org\x00",
+    ch_label ++ "\x07example\x03org\x00",
+    ch_label ++ "\x06static\x07example\x03org\x00",
+    ch_label ++ "\x05alias\x07example\x03org\x00",
+    "\x03www\x07example\x03org\x00",
+    "\x0f_ACME-Challenge\x03GIT\x07example\x03org\x00",
+    ch_label ++ "\x03git\x07example\x03net\x00",
+};
+const values = [_][]const u8{ "\x04tok1", "\x04tok2", "\x05fixed", "\x01x\x01y", "", "\x05ab" };
+const fill_rdata = "\x04fill";
+
+fn pick(rand: std.Random, comptime T: type, items: []const T) T {
+    return items[rand.uintLessThan(usize, items.len)];
+}
+
+fn randomRRs(a: Allocator, rand: std.Random, max: usize, prereq: bool) Finding![]wire.RR {
+    const rrs = a.alloc(wire.RR, rand.uintAtMost(usize, max)) catch return error.Memory;
+    for (rrs) |*rr| rr.* = .{
+        .name = pick(rand, []const u8, &owners),
+        .type = pick(rand, wire.Type, &.{ .txt, .txt, .txt, .any, .a }),
+        .class = pick(rand, wire.Class, &.{ .in, .in, .any, .none, @enumFromInt(3) }),
+        .ttl = if (prereq and rand.uintLessThan(u8, 8) != 0) 0 else pick(rand, u32, &.{ 0, 30, 60, 3600 }),
+        .rdata = pick(rand, []const u8, &values),
+    };
+    return rrs;
+}
+
+/// Fills the overlay with distinct records up to `n`.
+fn fill(o: *update.Overlay, gpa: Allocator, n: usize) void {
+    var i: usize = o.records.items.len;
+    while (o.records.items.len < n) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, ch_label ++ "\x05f{d:0>4}\x07example\x03org\x00", .{i % 10000}) catch unreachable;
+        o.records.append(gpa, .{ .name = gpa.dupe(u8, name) catch return, .rdata = gpa.dupe(u8, fill_rdata) catch return, .ttl = 60, .expires = std.math.maxInt(i64) }) catch return;
+    }
+}
+
+fn snapshot(a: Allocator, o: *const update.Overlay) Finding![]update.Overlay.Record {
+    const copy = a.alloc(update.Overlay.Record, o.records.items.len) catch return error.Memory;
+    for (copy, o.records.items) |*c, r| c.* = .{ .name = a.dupe(u8, r.name) catch return error.Memory, .rdata = a.dupe(u8, r.rdata) catch return error.Memory, .ttl = r.ttl, .expires = r.expires };
+    return copy;
+}
+
+fn unchanged(before: []const update.Overlay.Record, o: *const update.Overlay) bool {
+    if (before.len != o.records.items.len) return false;
+    for (before, o.records.items) |p, q| if (!std.mem.eql(u8, p.name, q.name) or !std.mem.eql(u8, p.rdata, q.rdata) or p.ttl != q.ttl or p.expires != q.expires) return false;
+    return true;
+}
+
+/// ADR 0006 and valid RRsets: challenge TXT owners in the zone, capped TTLs, no duplicate, no
+/// copy of a static value, nothing at a static CNAME.
+fn invariants(z: *const zone.Zone, o: *const update.Overlay) bool {
+    if (o.records.items.len > update.max_records) return false;
+    for (o.records.items, 0..) |r, i| {
+        if (!std.mem.startsWith(u8, r.name, ch_label) or !zone.isUnder(r.name, z.origin) or r.ttl > o.max_ttl) return false;
+        if (z.lookup(r.name)) |name| {
+            if (name.get(.cname) != null) return false;
+            if (name.get(.txt)) |set| for (set.rdatas) |rd| if (std.mem.eql(u8, rd, r.rdata)) return false;
+        }
+        if (std.mem.eql(u8, r.rdata, fill_rdata)) continue; // fillers are distinct by construction
+        for (o.records.items[i + 1 ..]) |q| if (std.mem.eql(u8, q.name, r.name) and std.mem.eql(u8, q.rdata, r.rdata)) return false;
+    }
+    return true;
+}
 
 fn same(x: wire.Message, y: wire.Message) bool {
     if (x.id != y.id or @as(u16, @bitCast(x.flags)) != @as(u16, @bitCast(y.flags)) or x.question.len != y.question.len) return false;
@@ -289,7 +397,7 @@ fn watchdog(io: std.Io) void {
     }
 }
 
-const usage = "usage: annai-fuzz <codec|respond|update|tcp> <seconds> [seed]\n";
+const usage = "usage: annai-fuzz <codec|respond|update|update-state|tcp> <seconds> [seed]\n";
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());

@@ -89,6 +89,8 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
         if (qflags.opcode == 5) if (ctx.metrics) |m| m.update(ctx.keys, null, .notauth);
         return r.finish(id, out, .notauth);
     };
+    // An expired record is gone before anything reads the overlay, not at the next sweep (review A12).
+    if (ctx.overlay) |o| o.expire(ctx.mono);
     if (qflags.opcode == 5) {
         const key = if (r.tsig) |t| t.key.?.name else null;
         const rc = update.apply(ctx.overlay, ctx.zones, msg, key, ctx.mono);
@@ -129,7 +131,19 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
         const static = lookup(z, overlay, owner);
         if (static) |name| if (name.get(q.type)) |set| for (set.rdatas) |rd| r.answer(.{ .name = owner, .type = set.type, .ttl = set.ttl, .rdata = rd });
         // ADR 0006: dynamic records come after the static ones, never instead of them.
-        if (overlay) |o| if (q.type == .txt) for (o.records.items) |rec| if (std.mem.eql(u8, rec.name, owner)) r.answer(.{ .name = owner, .type = .txt, .ttl = rec.ttl, .rdata = rec.rdata });
+        if (overlay != null and q.type == .txt) {
+            var dynamic_ttl: ?u32 = null;
+            for (overlay.?.records.items) |rec| if (std.mem.eql(u8, rec.name, owner)) {
+                // Never cached past the local lifetime (review A12); `expire` left at least one second.
+                const ttl: u32 = @intCast(@min(rec.ttl, rec.expires - ctx.mono));
+                dynamic_ttl = @min(dynamic_ttl orelse ttl, ttl);
+                r.answer(.{ .name = owner, .type = .txt, .ttl = ttl, .rdata = rec.rdata });
+            };
+            // RFC 2181 §5.2: one TTL for the whole RRset, static members included (review A8).
+            if (dynamic_ttl) |ttl| for (r.answers.items[before..]) |*rr| {
+                rr.ttl = @min(rr.ttl, ttl);
+            };
+        }
         if (r.answers.items.len > before) return r.finish(id, out, .noerror);
         // A name with dynamic records below it exists (ADR 0004): NODATA, not NXDOMAIN.
         const name = static orelse return r.negative(id, out, z, if (dynamic(overlay, owner)) .noerror else .nxdomain);
@@ -323,6 +337,10 @@ pub const apex_zone =
     \\a = ["192.0.2.53"]
     \\[names."*"]
     \\txt = ["wild"]
+    \\[names."_acme-challenge.static"]
+    \\txt = ["fixed"]
+    \\[names."_acme-challenge.alias"]
+    \\cname = "ns1"
 ;
 
 const Fixture = struct {
@@ -745,4 +763,52 @@ test "every record of a 65-value RRset is served over TCP and EDNS, or TC is set
     try testing.expectEqual(@as(usize, 65), edns.answer.len); // 65 short values fit in 1232 bytes
     const plain = try f.ask(.{ .name = name, .type = .txt });
     try testing.expect(plain.flags.tc and plain.answer.len < 65);
+}
+
+test "one TTL per TXT RRset, never beyond the overlay lifetime (review A8, A12)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    f.soto(0); // monotonic 1000
+    const gpa = f.overlay.gpa;
+    for ([_]struct { []const u8, []const u8, u32, i64 }{
+        .{ "\x0f_acme-challenge\x03git\x07example\x03org\x00", "\x011", 30, 5000 },
+        .{ "\x0f_acme-challenge\x03git\x07example\x03org\x00", "\x012", 60, 5000 },
+        .{ "\x0f_acme-challenge\x06static\x07example\x03org\x00", "\x013", 120, 1000 + 90 },
+        .{ "\x0f_acme-challenge\x04gone\x07example\x03org\x00", "\x014", 120, 1000 },
+    }) |e| try f.overlay.records.append(gpa, .{ .name = try gpa.dupe(u8, e[0]), .rdata = try gpa.dupe(u8, e[1]), .ttl = e[2], .expires = e[3] });
+    const git = try f.ask(.{ .name = "_acme-challenge.git.example.org.", .type = .txt });
+    try testing.expectEqual(@as(usize, 2), git.answer.len);
+    for (git.answer) |rr| try testing.expectEqual(@as(u32, 30), rr.ttl);
+    // The static value (zone TTL 300) and the dynamic one (TTL 120, 90 s left) share 90.
+    const static = try f.ask(.{ .name = "_acme-challenge.static.example.org.", .type = .txt });
+    try testing.expectEqual(@as(usize, 2), static.answer.len);
+    for (static.answer) |rr| try testing.expectEqual(@as(u32, 90), rr.ttl);
+    // Expired at this very second: not served even though the sweep has not run.
+    const gone = try f.ask(.{ .name = "_acme-challenge.gone.example.org.", .type = .txt });
+    try testing.expect(gone.answer.len == 1 and std.mem.eql(u8, gone.answer[0].rdata, "\x04wild"));
+    try testing.expectEqual(@as(usize, 3), f.overlay.records.items.len);
+}
+
+test "an UPDATE signed with a truncated MAC is applied and answered signed (review A7)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    f.soto(tsig.vector.time);
+    var vbuf: [256]u8 = undefined;
+    const pkt = tsig.vector.packet(&vbuf);
+    for ([_]usize{ 15, 16 }) |size| {
+        @memcpy(f.buf[0 .. pkt.len - 78], pkt[0 .. pkt.len - 78]);
+        f.buf[11] = 0;
+        const len = tsig.signRequest(tsig.vector.key, &f.buf, pkt.len - 78, tsig.vector.time, size);
+        const ack = try f.reply(f.buf[0..len], .udp);
+        if (size == 15) {
+            try testing.expectEqual(Rcode.formerr, @as(Rcode, @enumFromInt(ack.flags.rcode)));
+            try testing.expectEqual(@as(usize, 0), f.overlay.records.items.len);
+            continue;
+        }
+        try testing.expectEqual(Rcode.noerror, @as(Rcode, @enumFromInt(ack.flags.rcode)));
+        try testing.expect(ack.tsig_at != null and f.overlay.records.items.len == 1);
+        var want: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&want, tsig.vector.truncated_response_mac);
+        try testing.expectEqualSlices(u8, &want, f.out[f.last_len - 38 .. f.last_len - 6]);
+    }
 }

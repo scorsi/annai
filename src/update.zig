@@ -39,32 +39,6 @@ pub const Overlay = struct {
         return false;
     }
 
-    /// Adds a TXT record or refreshes the identical one; the TTL and lifetime caps apply.
-    fn add(o: *Overlay, name: []const u8, rdata: []const u8, ttl: u32, now: i64) error{ Full, OutOfMemory }!void {
-        const capped = @min(ttl, o.max_ttl);
-        const expires = now + o.lifetime;
-        for (o.records.items) |*r| if (std.mem.eql(u8, r.name, name) and std.mem.eql(u8, r.rdata, rdata)) {
-            r.ttl = capped;
-            r.expires = expires;
-            return;
-        };
-        if (o.records.items.len >= max_records) return error.Full;
-        const n = try o.gpa.dupe(u8, name);
-        errdefer o.gpa.free(n);
-        const d = try o.gpa.dupe(u8, rdata);
-        errdefer o.gpa.free(d);
-        try o.records.append(o.gpa, .{ .name = n, .rdata = d, .ttl = capped, .expires = expires });
-    }
-
-    /// Deletes the record with this RDATA, or every record of the name when `rdata` is null.
-    fn remove(o: *Overlay, name: []const u8, rdata: ?[]const u8) void {
-        var i: usize = 0;
-        while (i < o.records.items.len) {
-            const r = o.records.items[i];
-            if (std.mem.eql(u8, r.name, name) and (rdata == null or std.mem.eql(u8, r.rdata, rdata.?))) o.free(o.records.swapRemove(i)) else i += 1;
-        }
-    }
-
     /// Drops the records whose lifetime is over.
     pub fn expire(o: *Overlay, now: i64) void {
         var i: usize = 0;
@@ -76,6 +50,64 @@ pub const Overlay = struct {
     fn free(o: *Overlay, r: Record) void {
         o.gpa.free(r.name);
         o.gpa.free(r.rdata);
+    }
+};
+
+/// The overlay as an UPDATE leaves it, built beside the live one and swapped in only once every
+/// change succeeded: a full overlay or a failed allocation changes nothing (RFC 2136 §3.4, review A3).
+const Draft = struct {
+    o: *Overlay,
+    next: std.ArrayList(Overlay.Record),
+    /// `next[0..kept]` are live records, in their order; `next[kept..]` were allocated here.
+    kept: usize,
+
+    fn init(o: *Overlay) error{OutOfMemory}!Draft {
+        return .{ .o = o, .next = try o.records.clone(o.gpa), .kept = o.records.items.len };
+    }
+
+    /// Adds a TXT record or refreshes the identical one; the TTL and lifetime caps apply.
+    fn add(d: *Draft, name: []const u8, rdata: []const u8, ttl: u32, now: i64) error{ Full, OutOfMemory }!void {
+        const capped = @min(ttl, d.o.max_ttl);
+        const expires = now + d.o.lifetime;
+        for (d.next.items) |*r| if (std.mem.eql(u8, r.name, name) and std.mem.eql(u8, r.rdata, rdata)) {
+            r.ttl = capped;
+            r.expires = expires;
+            return;
+        };
+        if (d.next.items.len >= max_records) return error.Full;
+        const n = try d.o.gpa.dupe(u8, name);
+        errdefer d.o.gpa.free(n);
+        const v = try d.o.gpa.dupe(u8, rdata);
+        errdefer d.o.gpa.free(v);
+        try d.next.append(d.o.gpa, .{ .name = n, .rdata = v, .ttl = capped, .expires = expires });
+    }
+
+    /// Deletes the record with this RDATA, or every record of the name when `rdata` is null.
+    fn remove(d: *Draft, name: []const u8, rdata: ?[]const u8) void {
+        var i: usize = 0;
+        while (i < d.next.items.len) {
+            const r = d.next.items[i];
+            if (!std.mem.eql(u8, r.name, name) or (rdata != null and !std.mem.eql(u8, r.rdata, rdata.?))) {
+                i += 1;
+                continue;
+            }
+            if (i < d.kept) d.kept -= 1 else d.o.free(r); // a live record is freed on commit
+            _ = d.next.orderedRemove(i);
+        }
+    }
+
+    fn commit(d: *Draft) void {
+        var j: usize = 0;
+        for (d.o.records.items) |r| {
+            if (j < d.kept and d.next.items[j].name.ptr == r.name.ptr) j += 1 else d.o.free(r);
+        }
+        d.o.records.deinit(d.o.gpa);
+        d.o.records = d.next;
+    }
+
+    fn abort(d: *Draft) void {
+        for (d.next.items[d.kept..]) |r| d.o.free(r);
+        d.next.deinit(d.o.gpa);
     }
 };
 
@@ -103,7 +135,8 @@ pub fn apply(overlay: ?*Overlay, zones: []const zone.Zone, m: wire.Message, key:
             .any, .none => {
                 if (p.rdata.len != 0) return .formerr;
                 if (!isChallenge(owner) or !(whole_name or p.type == .txt)) return refused(k, "prerequisite", owner);
-                const present = if (whole_name) z.lookup(owner) != null or o.exists(owner) else count(z, o, owner) > 0;
+                // §2.4.4: "in use" means an RR at this very name; an empty non-terminal is not (review A9).
+                const present = if (whole_name) inUse(z, o, owner) else count(z, o, owner) > 0;
                 if (p.class == .any and !present) return if (whole_name) .nxdomain else .nxrrset;
                 if (p.class == .none and present) return if (whole_name) .yxdomain else .yxrrset;
             },
@@ -138,26 +171,37 @@ pub fn apply(overlay: ?*Overlay, zones: []const zone.Zone, m: wire.Message, key:
         }
     }
 
-    // §3.4.2: the changes, on the overlay only; static RRsets and the SOA serial never move.
+    // §3.4.2: the changes, on a draft of the overlay only; static RRsets and the SOA serial never move.
+    var d = Draft.init(o) catch return failed(k, z.origin, error.OutOfMemory);
     for (m.authority) |u| {
         var nbuf: [255]u8 = undefined;
         const owner = lowerInto(&nbuf, u.name);
         switch (u.class) {
-            .in => o.add(owner, u.rdata, u.ttl, now) catch |e| {
-                log.event(.warn, "update-failed", .{ .key = zone.fmt(k), .owner = zone.fmt(owner), .reason = @errorName(e) });
-                return .servfail;
+            // §3.4.2.2 and RFC 2181 §5: TXT beside a CNAME and a copy of a static RR are ignored (review A8).
+            .in => if (!staticDecides(z, owner, u.rdata)) d.add(owner, u.rdata, u.ttl, now) catch |e| {
+                d.abort();
+                return failed(k, owner, e);
             },
-            .any => o.remove(owner, null),
-            .none => o.remove(owner, u.rdata),
+            .any => d.remove(owner, null),
+            .none => d.remove(owner, u.rdata),
             else => unreachable, // prescan
         }
-        log.event(.info, "update", .{ .key = zone.fmt(k), .owner = zone.fmt(owner), .op = switch (u.class) {
+    }
+    d.commit();
+    for (m.authority) |u| {
+        var nbuf: [255]u8 = undefined;
+        log.event(.info, "update", .{ .key = zone.fmt(k), .owner = zone.fmt(lowerInto(&nbuf, u.name)), .op = switch (u.class) {
             .in => "add",
             .any => "delete-rrset",
             else => "delete",
         }, .records = o.records.items.len });
     }
     return .noerror;
+}
+
+fn failed(key: []const u8, owner: []const u8, e: anyerror) Rcode {
+    log.event(.warn, "update-failed", .{ .key = zone.fmt(key), .owner = zone.fmt(owner), .reason = @errorName(e) });
+    return .servfail;
 }
 
 fn refused(key: ?[]const u8, reason: []const u8, owner: ?[]const u8) Rcode {
@@ -196,6 +240,21 @@ fn count(z: *const zone.Zone, o: *const Overlay, owner: []const u8) usize {
     return n;
 }
 
+/// Whether `owner` holds an RR: a static RRset or a dynamic record at that exact name.
+fn inUse(z: *const zone.Zone, o: *const Overlay, owner: []const u8) bool {
+    if (z.lookup(owner)) |name| if (name.rrsets.len > 0) return true;
+    for (o.records.items) |r| if (std.mem.eql(u8, r.name, owner)) return true;
+    return false;
+}
+
+/// Whether the static data already decides this TXT: a CNAME at `owner` or the same static value.
+fn staticDecides(z: *const zone.Zone, owner: []const u8, rdata: []const u8) bool {
+    const name = z.lookup(owner) orelse return false;
+    if (name.get(.cname) != null) return true;
+    if (name.get(.txt)) |set| for (set.rdatas) |rd| if (std.mem.eql(u8, rd, rdata)) return true;
+    return false;
+}
+
 fn has(z: *const zone.Zone, o: *const Overlay, owner: []const u8, rdata: []const u8) bool {
     if (z.lookup(owner)) |name| if (name.get(.txt)) |set| for (set.rdatas) |rd| if (std.mem.eql(u8, rd, rdata)) return true;
     for (o.records.items) |r| if (std.mem.eql(u8, r.name, owner) and std.mem.eql(u8, r.rdata, rdata)) return true;
@@ -224,6 +283,10 @@ const apex =
     \\a = ["192.0.2.53"]
     \\[names."_acme-challenge.static"]
     \\txt = ["fixed"]
+    \\[names."_acme-challenge.alias"]
+    \\cname = "ns1"
+    \\[names."x._acme-challenge.ent"]
+    \\txt = ["below"]
 ;
 
 /// One prerequisite or update RR; `txt` is the single <character-string> of its RDATA.
@@ -381,4 +444,78 @@ test "prerequisites per RFC 2136 §3.2, within the policy" {
     try testing.expectEqual(Rcode.refused, try f.send("example.org.", &.{.{ .name = "example.org.", .class = .any, .type = .any, .ttl = 0 }}, &.{}, 0));
     try testing.expectEqual(Rcode.refused, try f.send("example.org.", &.{.{ .name = ch, .class = .any, .type = .a, .ttl = 0 }}, &.{}, 0));
     try testing.expectEqual(Rcode.refused, try f.send("example.org.", &.{.{ .name = "ns1.example.org.", .ttl = 0, .txt = "x" }}, &.{}, 0));
+}
+
+test "a failing UPDATE changes nothing: full overlay, failed allocation (review A3)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{}, &.{.{ .name = ch, .txt = "old" }}, 0));
+    var name_buf: [64]u8 = undefined;
+    for (1..max_records - 1) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "_acme-challenge.n{d}.example.org.", .{i});
+        try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{}, &.{.{ .name = name, .txt = "x" }}, 0));
+    }
+    try testing.expectEqual(@as(usize, max_records - 1), f.overlay.records.items.len);
+    // The reviewer's case: room for one of two new values, so neither is installed.
+    const two = [_]Op{ .{ .name = "_acme-challenge.a.example.org.", .txt = "1" }, .{ .name = "_acme-challenge.a.example.org.", .txt = "2" } };
+    try testing.expectEqual(Rcode.servfail, try f.send("example.org.", &.{}, &two, 0));
+    try testing.expectEqual(@as(usize, 0), f.values("_acme-challenge.a.example.org."));
+    try testing.expectEqual(@as(usize, max_records - 1), f.overlay.records.items.len);
+    // A delete frees room inside the transaction, then a failing add: the deleted value stays.
+    const swap = [_]Op{ .{ .name = ch, .class = .none, .ttl = 0, .txt = "old" }, .{ .name = ch, .txt = "new1" }, .{ .name = ch, .txt = "new2" }, .{ .name = ch, .txt = "new3" } };
+    try testing.expectEqual(Rcode.servfail, try f.send("example.org.", &.{}, &swap, 0));
+    try testing.expect(f.hasTxt(ch, "\x03old") and f.values(ch) == 1);
+    // Deletes and refreshes count before the cap: this one fits exactly.
+    try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{}, swap[0..3], 0));
+    try testing.expect(!f.hasTxt(ch, "\x03old") and f.values(ch) == 2);
+    try testing.expectEqual(@as(usize, max_records), f.overlay.records.items.len);
+}
+
+test "a failed allocation at any point of an UPDATE leaves the overlay as it was (review A3)" {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const f = try Fixture.init();
+        defer f.deinit();
+        try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{}, &.{ .{ .name = ch, .txt = "old" }, .{ .name = "_acme-challenge.b.example.org.", .txt = "b" } }, 0));
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        f.overlay.gpa = failing.allocator();
+        const rc = try f.send("example.org.", &.{}, &.{ .{ .name = ch, .class = .any, .ttl = 0 }, .{ .name = ch, .txt = "new" }, .{ .name = "_acme-challenge.c.example.org.", .txt = "c" } }, 0);
+        f.overlay.gpa = testing.allocator;
+        if (rc == .noerror) {
+            try testing.expect(f.hasTxt(ch, "\x03new") and !f.hasTxt(ch, "\x03old") and f.values("_acme-challenge.c.example.org.") == 1);
+            break;
+        }
+        try testing.expectEqual(Rcode.servfail, rc);
+        try testing.expect(f.hasTxt(ch, "\x03old") and f.values(ch) == 1 and f.values("_acme-challenge.c.example.org.") == 0);
+        try testing.expectEqual(@as(usize, 2), f.overlay.records.items.len);
+    }
+    try testing.expect(i > 0);
+}
+
+test "additions keep RRsets valid: no copy of a static RR, nothing beside a CNAME (review A8)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const static = "_acme-challenge.static.example.org.";
+    try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{}, &.{ .{ .name = static, .txt = "fixed" }, .{ .name = "_ACME-challenge.alias.example.org.", .txt = "x" } }, 0));
+    try testing.expectEqual(@as(usize, 0), f.overlay.records.items.len);
+    try testing.expectEqual(@as(usize, 1), f.values(static));
+    // The exact-value prerequisite on the static value still holds.
+    try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{.{ .name = static, .ttl = 0, .txt = "fixed" }}, &.{}, 0));
+    // A new value beside the static one is a member of the same RRset.
+    try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{}, &.{.{ .name = static, .txt = "more" }}, 0));
+    try testing.expectEqual(@as(usize, 2), f.values(static));
+}
+
+test "name in use means an RR at that very name, not an empty non-terminal (review A9)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const nested = "_acme-challenge._acme-challenge.git.uchi.example.org.";
+    try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{}, &.{.{ .name = nested, .txt = "x" }}, 0));
+    // `ch` is now an empty non-terminal of the overlay, `_acme-challenge.ent` one of the static zone.
+    for ([_][]const u8{ ch, "_acme-challenge.ent.example.org." }) |ent| {
+        try testing.expectEqual(Rcode.nxdomain, try f.send("example.org.", &.{.{ .name = ent, .class = .any, .type = .any, .ttl = 0 }}, &.{}, 0));
+        try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{.{ .name = ent, .class = .none, .type = .any, .ttl = 0 }}, &.{}, 0));
+    }
+    try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{.{ .name = nested, .class = .any, .type = .any, .ttl = 0 }}, &.{}, 0));
+    try testing.expectEqual(Rcode.noerror, try f.send("example.org.", &.{.{ .name = "_acme-challenge.alias.example.org.", .class = .any, .type = .any, .ttl = 0 }}, &.{}, 0));
 }

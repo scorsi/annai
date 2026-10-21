@@ -18,7 +18,8 @@ pub fn build(b: *std.Build) void {
 
     // Not installed: the fuzzer is a developer tool (ADR 0011), run with `zig build fuzz -- <target> <seconds> [seed]`.
     const fuzz = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize, .imports = imports });
+    fuzz.addOptions("build_options", options); // the `tcp` target runs src/server.zig
     const run_fuzz = b.addRunArtifact(b.addExecutable(.{ .name = "annai-fuzz", .root_module = fuzz }));
     if (b.args) |args| run_fuzz.addArgs(args);
-    b.step("fuzz", "Fuzz a target: zig build fuzz -- <codec|respond|update> <seconds> [seed]").dependOn(&run_fuzz.step);
+    b.step("fuzz", "Fuzz a target: zig build fuzz -- <codec|respond|update|tcp> <seconds> [seed]").dependOn(&run_fuzz.step);
 }

@@ -5,7 +5,11 @@
 //! the transport limit and keep the query ID, and a request must never take more than
 //! `max_request_bytes`. Crashes, safety traps and hangs print the input in hex as well.
 //!
-//! By hand: `zig build fuzz -- <codec|respond|update> <seconds> [seed]` (or `nix run .#fuzz`, in
+//! The `tcp` target drives a real server on a loopback port (src/server.zig `Loopback`): the
+//! input, framed and then raw, goes over one connection in chunks the input's hash picks, and
+//! the stream invariants of `Loopback.checkStream` must hold (review A17).
+//!
+//! By hand: `zig build fuzz -- <codec|respond|update|tcp> <seconds> [seed]` (or `nix run .#fuzz`, in
 //! ReleaseSafe); findings are `fuzz: ...` lines on stderr. Every finding becomes a line of
 //! src/corpus/fuzz.txt, which `zig build test` replays through every target.
 
@@ -16,15 +20,16 @@ const engine = @import("engine.zig");
 const update = @import("update.zig");
 const tsig = @import("tsig.zig");
 const config = @import("config.zig");
+const server = @import("server.zig");
 const Allocator = std.mem.Allocator;
 
-pub const Target = enum { codec, respond, update };
+pub const Target = enum { codec, respond, update, tcp };
 
 /// Per-request memory a message of at most 64 KiB may take; more is a finding.
 pub const max_request_bytes = 8 << 20;
 const max_packet = 65535;
 
-pub const Finding = error{ Encode, Reparse, RoundTrip, Oversize, IdLost, NotResponse, Memory, Overflow };
+pub const Finding = error{ Encode, Reparse, RoundTrip, Oversize, IdLost, NotResponse, Memory, Overflow, Stream };
 
 pub const Fixture = struct {
     gpa: Allocator,
@@ -38,6 +43,9 @@ pub const Fixture = struct {
     seeds: std.ArrayList([]const u8) = .empty,
     out: [max_packet]u8 = undefined,
     peak: usize = 0,
+    /// The `tcp` target's server, started on first use.
+    loopback: ?*server.Loopback = null,
+    stream: [2 * max_packet + 2]u8 = undefined,
 
     pub fn init(gpa: Allocator) !*Fixture {
         const f = try gpa.create(Fixture);
@@ -62,6 +70,7 @@ pub const Fixture = struct {
     }
 
     pub fn deinit(f: *Fixture) void {
+        if (f.loopback) |l| l.deinit();
         f.overlay.deinit();
         f.arena.deinit();
         f.gpa.destroy(f);
@@ -114,6 +123,7 @@ pub const Fixture = struct {
             .codec => try f.codec(a, packet),
             .respond => try f.respond(a, packet),
             .update => try f.applyUpdate(a, packet),
+            .tcp => try f.tcp(packet),
         }
         if (f.fba.end_index > max_request_bytes) return error.Memory;
     }
@@ -155,6 +165,20 @@ pub const Fixture = struct {
         if (!std.mem.eql(u8, f.out[0..2], id)) return error.IdLost;
         const m = wire.Message.parse(a, f.out[0..n]) catch return error.Reparse;
         if (!m.flags.qr) return error.NotResponse;
+    }
+
+    fn tcp(f: *Fixture, packet: []const u8) Finding!void {
+        const l = f.loopback orelse (server.Loopback.init(f.gpa, .{}) catch return error.Stream);
+        f.loopback = l;
+        // shortcut: one connection per 3 ms stays under the ephemeral ports that TIME_WAIT holds
+        // (about 16k for 30 s on macOS, 28k for 60 s on Linux); a faster loop runs out and fails to connect.
+        _ = std.posix.poll(&.{}, 3) catch {};
+        const n = @min(packet.len, max_packet);
+        std.mem.writeInt(u16, f.stream[0..2], @intCast(n), .big);
+        @memcpy(f.stream[2..][0..n], packet[0..n]);
+        @memcpy(f.stream[2 + n ..][0..n], packet[0..n]); // as framing bytes: its ID is a length prefix
+        var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, packet));
+        try l.checkStream(f.stream[0 .. 2 + 2 * n], prng.random());
     }
 
     fn applyUpdate(f: *Fixture, a: Allocator, packet: []const u8) Finding!void {
@@ -265,7 +289,7 @@ fn watchdog(io: std.Io) void {
     }
 }
 
-const usage = "usage: annai-fuzz <codec|respond|update> <seconds> [seed]\n";
+const usage = "usage: annai-fuzz <codec|respond|update|tcp> <seconds> [seed]\n";
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());

@@ -76,7 +76,9 @@ pub const Message = struct {
     tsig_at: ?usize = null,
 
     pub fn parse(a: Allocator, packet: []const u8) ParseError!Message {
-        var r: Reader = .{ .buf = packet };
+        // One pointer hop per packet byte (review A1): names re-walking a chain of pointers would
+        // otherwise cost quadratic work in a packet that is small and valid.
+        var r: Reader = .{ .buf = packet, .hops = packet.len };
         var m: Message = .{};
         m.id = try r.int(u16);
         m.flags = @bitCast(try r.int(u16));
@@ -154,6 +156,8 @@ fn layout(t: Type) ?[]const Field {
 pub const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
+    /// Compression pointers `name` may still follow, over every name read; out = Malformed.
+    hops: usize = std.math.maxInt(usize),
 
     pub fn take(r: *Reader, n: usize) error{Malformed}![]const u8 {
         if (r.buf.len - r.pos < n) return error.Malformed;
@@ -188,7 +192,8 @@ pub const Reader = struct {
                 0xC0 => {
                     if (pos + 2 > r.buf.len) return error.Malformed;
                     const target = @as(usize, c & 0x3F) << 8 | r.buf[pos + 1];
-                    if (target >= pos) return error.Malformed;
+                    if (target >= pos or r.hops == 0) return error.Malformed;
+                    r.hops -= 1;
                     if (!jumped) r.pos = pos + 2;
                     jumped = true;
                     pos = target;
@@ -216,18 +221,19 @@ fn parseRRs(a: Allocator, r: *Reader, count: u16, last: *usize) ParseError![]con
         const raw = try r.take(try r.int(u16));
         rr.rdata = raw;
         if (layout(rr.type)) |fields| if (raw.len != 0 or rr.class != .any) {
-            rr.rdata = try decompress(a, r.buf[0..r.pos], r.pos - raw.len, fields);
+            rr.rdata = try decompress(a, r, raw.len, fields);
         };
     }
     return rrs;
 }
 
-/// Rewrites the RDATA at `start..packet.len` with its names expanded; pointers may reach any
-/// earlier byte of the packet. The RDATA must be consumed exactly.
-fn decompress(a: Allocator, packet: []const u8, start: usize, fields: []const Field) ParseError![]const u8 {
+/// Rewrites the `raw_len` bytes of RDATA just read by `outer` with its names expanded; pointers
+/// may reach any earlier byte of the packet. The RDATA must be consumed exactly.
+fn decompress(a: Allocator, outer: *Reader, raw_len: usize, fields: []const Field) ParseError![]const u8 {
     var out: [2 * 255 + 20]u8 = undefined;
     var len: usize = 0;
-    var r: Reader = .{ .buf = packet, .pos = start };
+    var r: Reader = .{ .buf = outer.buf[0..outer.pos], .pos = outer.pos - raw_len, .hops = outer.hops };
+    defer outer.hops = r.hops;
     for (fields) |f| switch (f) {
         .name => {
             var tmp: [255]u8 = undefined;
@@ -240,7 +246,7 @@ fn decompress(a: Allocator, packet: []const u8, start: usize, fields: []const Fi
             len += n;
         },
     };
-    if (r.pos != packet.len) return error.Malformed;
+    if (r.pos != r.buf.len) return error.Malformed;
     return a.dupe(u8, out[0..len]);
 }
 
@@ -608,5 +614,42 @@ test "malformed corpus is rejected" {
             return error.TestUnexpectedResult;
         } else |e| try testing.expectEqual(error.Malformed, e);
     }
-    try testing.expectEqual(@as(usize, 24), count);
+    try testing.expectEqual(@as(usize, 25), count);
+}
+
+/// The review's A1 packet: `n` names after the root question, each a pointer to the previous
+/// name while that one's offset is below 0x4000, then to the last such one; as questions
+/// (`section` 4) or as the owners of A records in the answer section (`section` 6).
+pub fn pointerChain(buf: []u8, n: usize, section: usize) []const u8 {
+    const step: usize = if (section == 4) 6 else 16;
+    @memset(buf[0..12], 0);
+    std.mem.writeInt(u16, buf[4..6], 1, .big);
+    std.mem.writeInt(u16, buf[section..][0..2], @intCast(if (section == 4) n + 1 else n), .big);
+    @memcpy(buf[12..17], "\x00\x00\x01\x00\x01");
+    var len: usize = 17;
+    var prev: usize = 12;
+    for (0..n) |_| {
+        const here = len;
+        std.mem.writeInt(u16, buf[len..][0..2], @intCast(0xC000 | prev), .big);
+        @memcpy(buf[len + 2 ..][0 .. step - 2], ("\x00\x01\x00\x01" ++ "\x00\x00\x00\x00\x00\x04\x7f\x00\x00\x01")[0 .. step - 2]);
+        len += step;
+        if (here < 0x4000) prev = here;
+    }
+    return buf[0..len];
+}
+
+test "chained compression pointers run out of the per-packet budget (review A1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const buf = try testing.allocator.alloc(u8, 65535);
+    defer testing.allocator.free(buf);
+    // The review's packet: 65,501 bytes, 10,915 questions, ~54 ms each before the budget.
+    const qs = pointerChain(buf, 10914, 4);
+    try testing.expectEqual(@as(usize, 65501), qs.len);
+    try testing.expectError(error.Malformed, Message.parse(arena.allocator(), qs));
+    // The same chain on the owners of the answer section: a question-count check does not stop it.
+    try testing.expectError(error.Malformed, Message.parse(arena.allocator(), pointerChain(buf, 4000, 6)));
+    // A short chain is ordinary compression and still parses.
+    const short = try Message.parse(arena.allocator(), pointerChain(buf, 20, 6));
+    try testing.expectEqual(@as(usize, 20), short.answer.len);
 }

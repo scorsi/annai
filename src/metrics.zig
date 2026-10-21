@@ -49,20 +49,21 @@ pub const Metrics = struct {
         const p = @intFromEnum(proto);
         const t = if (qtype) |q| std.mem.indexOfScalar(wire.Type, qtypes, q) orelse qtypes.len else qtypes.len;
         const r: usize = if (rcode == 16) rcodes.len else if (rcode < 16) std.mem.indexOfScalar(wire.Rcode, rcodes, @enumFromInt(@as(u4, @intCast(rcode)))) orelse rcodes.len + 1 else rcodes.len + 1;
-        m.queries[p][t][r] += 1;
+        m.queries[p][t][r] +|= 1;
         const b = for (bounds_ns, 0..) |ns, i| {
             if (dur_ns <= ns) break i;
         } else bounds.len;
-        m.buckets[p][b] += 1;
-        m.sum_ns[p] += dur_ns;
+        m.buckets[p][b] +|= 1;
+        // Saturating (A15): a counter only goes up (masu convention) and telemetry never aborts the server.
+        m.sum_ns[p] +|= dur_ns;
     }
 
     pub fn cacheLookup(m: *Metrics, hit: bool) void {
-        m.cache[if (hit) 0 else 1] += 1;
+        m.cache[if (hit) 0 else 1] +|= 1;
     }
 
     pub fn upstream(m: *Metrics, i: usize, result: Upstream) void {
-        m.upstreams[i][@intFromEnum(result)] += 1;
+        m.upstreams[i][@intFromEnum(result)] +|= 1;
     }
 
     /// `key`: the wire name of the key that signed the UPDATE, null when unsigned or not authenticated.
@@ -75,7 +76,7 @@ pub const Metrics = struct {
             .refused => .refused,
             .notauth => .notauth,
             else => .@"error",
-        }))] += 1;
+        }))] +|= 1;
     }
 };
 
@@ -119,7 +120,7 @@ pub fn write(m: *const Metrics, info: Info, w: *Writer) Writer.Error!void {
         const proto = @tagName(@as(Proto, @enumFromInt(p)));
         var total: u64 = 0;
         for (counts, 0..) |n, i| {
-            total += n;
+            total +|= n;
             try w.print("annai_query_duration_seconds_bucket{{proto=\"{s}\",le=\"{s}\"}} {d}\n", .{ proto, if (i < bounds.len) bounds[i] else "+Inf", total });
         }
         try w.print("annai_query_duration_seconds_sum{{proto=\"{s}\"}} {d}\n", .{ proto, @as(f64, @floatFromInt(m.sum_ns[p])) / 1e9 });
@@ -212,4 +213,15 @@ test "exposition: closed label sets, cumulative buckets, escaped values" {
     try testing.expect(std.mem.endsWith(u8, text, "\n"));
     // One HELP and one TYPE per family.
     try testing.expectEqual(@as(usize, 8), std.mem.count(u8, text, "# TYPE "));
+}
+
+test "the summed duration saturates instead of trapping (review A15)" {
+    var m = try Metrics.init(testing.allocator, 0, 0);
+    defer m.deinit(testing.allocator);
+    m.sum_ns[0] = std.math.maxInt(u64) - 1;
+    m.query(.udp, .a, 0, 10_000_000_000);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), m.sum_ns[0]);
+    m.queries[0][0][0] = std.math.maxInt(u64);
+    m.query(.udp, qtypes[0], 0, 1);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), m.queries[0][0][0]);
 }

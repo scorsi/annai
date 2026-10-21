@@ -62,7 +62,10 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
         .flags = .{ .qr = true, .opcode = qflags.opcode, .rd = qflags.rd, .ra = forward != null },
         .limit = if (transport == .tcp) out.len else min_udp_payload,
         .now = ctx.now,
+        .arena = arena,
     };
+    // Exactly one question (RFC 9619), checked before decoding anything (review A1).
+    if (std.mem.readInt(u16, query[4..6], .big) != 1) return r.finish(id, out, .formerr);
     const msg = wire.Message.parse(arena, query) catch |e| switch (e) {
         error.Malformed => return r.finish(id, out, .formerr),
         error.OutOfMemory => return r.finish(id, out, .servfail),
@@ -76,7 +79,6 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
             return r.finish(id, out, .noerror);
         }
     }
-    if (msg.question.len != 1) return r.finish(id, out, .formerr);
     const q = msg.question[0];
     r.question = q;
     // A signed message is verified before it is acted upon; a failure is NOTAUTH with the TSIG
@@ -123,12 +125,12 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
     var owner: []const u8 = qname;
     var hops: usize = 0;
     while (true) : (hops += 1) {
-        const before = r.n_answers;
+        const before = r.answers.items.len;
         const static = lookup(z, overlay, owner);
         if (static) |name| if (name.get(q.type)) |set| for (set.rdatas) |rd| r.answer(.{ .name = owner, .type = set.type, .ttl = set.ttl, .rdata = rd });
         // ADR 0006: dynamic records come after the static ones, never instead of them.
         if (overlay) |o| if (q.type == .txt) for (o.records.items) |rec| if (std.mem.eql(u8, rec.name, owner)) r.answer(.{ .name = owner, .type = .txt, .ttl = rec.ttl, .rdata = rec.rdata });
-        if (r.n_answers > before) return r.finish(id, out, .noerror);
+        if (r.answers.items.len > before) return r.finish(id, out, .noerror);
         // A name with dynamic records below it exists (ADR 0004): NODATA, not NXDOMAIN.
         const name = static orelse return r.negative(id, out, z, if (dynamic(overlay, owner)) .noerror else .nxdomain);
         const cname = name.get(.cname) orelse return r.negative(id, out, z, .noerror);
@@ -166,7 +168,7 @@ fn lookup(z: *const zone.Zone, overlay: ?*const update.Overlay, name: []const u8
 /// The answer to a forwarded query from a validated upstream response, every TTL set to `ttl`
 /// (the remaining cache lifetime); a null or unparsable `upstream` is SERVFAIL. RA=1, AA=0 (ADR 0008).
 pub fn forwarded(arena: std.mem.Allocator, f: Forward, upstream: ?[]const u8, ttl: u32, out: []u8) usize {
-    var r: Response = .{ .flags = .{ .qr = true, .rd = f.rd, .ra = true }, .limit = f.limit, .question = f.question, .opt = f.opt };
+    var r: Response = .{ .flags = .{ .qr = true, .rd = f.rd, .ra = true }, .limit = f.limit, .question = f.question, .opt = f.opt, .arena = arena };
     const m = wire.Message.parse(arena, upstream orelse return r.finish(f.id, out, .servfail).?) catch return r.finish(f.id, out, .servfail).?;
     var sections: [3][]wire.RR = undefined;
     for (&sections, [_][]const wire.RR{ m.answer, m.authority, m.additional }) |*dst, src| {
@@ -190,16 +192,19 @@ const Response = struct {
     question: ?wire.Question = null,
     opt: ?wire.Opt = null,
     tsig: ?tsig.Status = null,
-    answers: [64]wire.RR = undefined,
-    n_answers: usize = 0,
+    /// Every selected record, in the request arena: the writer, not the collector, decides what
+    /// fits and sets TC (review A4: a fixed 64 dropped records silently, over TCP too).
+    arena: std.mem.Allocator,
+    answers: std.ArrayList(wire.RR) = .empty,
+    oom: bool = false,
     authority: ?wire.RR = null,
     /// The sections of a forwarded answer; additional records are dropped when they do not fit.
     upstream: ?wire.Message = null,
 
     fn answer(r: *Response, rr: wire.RR) void {
-        if (r.n_answers == r.answers.len) return; // a 65th record would not fit a UDP answer anyway; TCP gets 64
-        r.answers[r.n_answers] = rr;
-        r.n_answers += 1;
+        r.answers.append(r.arena, rr) catch {
+            r.oom = true;
+        };
     }
 
     /// NXDOMAIN or NODATA: the SOA in the authority section (RFC 2308 §2) with the negative TTL.
@@ -209,7 +214,11 @@ const Response = struct {
     }
 
     fn finish(r: *Response, id: u16, out: []u8, rcode: Rcode) ?usize {
-        r.flags.rcode = @intFromEnum(rcode);
+        if (r.oom) { // never a silently incomplete RRset
+            r.answers.clearRetainingCapacity();
+            r.authority = null;
+        }
+        r.flags.rcode = @intFromEnum(if (r.oom) .servfail else rcode);
         // The OPT and the TSIG are written last but must always fit: their bytes are reserved up front.
         const opt_len: usize = if (r.opt != null) 11 else 0;
         const tsig_len: usize = if (r.tsig) |t| t.size() else 0;
@@ -218,7 +227,7 @@ const Response = struct {
         if (r.question) |q| w.question(q) catch {
             r.flags.tc = true;
         };
-        if (!r.flags.tc) for (r.answers[0..r.n_answers]) |rr| w.rr(.answer, rr) catch {
+        if (!r.flags.tc) for (r.answers.items) |rr| w.rr(.answer, rr) catch {
             r.flags.tc = true;
             break;
         };
@@ -702,4 +711,38 @@ test "soto: BIND's signed UPDATE is applied and answered signed; the overlay is 
     try testing.expectEqual(Rcode.refused, @as(Rcode, @enumFromInt(bare.flags.rcode)));
     try testing.expectEqual(@as(usize, 1), f.overlay.records.items.len);
     try testing.expectEqual(@as(usize, 0), bare.additional.len);
+}
+
+test "a question count other than one is FORMERR before anything is decoded (review A1)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const chain = wire.pointerChain(&f.buf, 10914, 4); // the review's 65,501-byte packet
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const n = respond(failing.allocator(), f.ctx, chain, &f.out, .tcp, null).?;
+    const m = try wire.Message.parse(f.arena.allocator(), f.out[0..n]);
+    try testing.expectEqual(Rcode.formerr, @as(Rcode, @enumFromInt(m.flags.rcode)));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+    // One question but a chain on the answer owners: the parser's hop budget refuses it.
+    const owners = try f.reply(wire.pointerChain(&f.buf, 4000, 6), .tcp);
+    try testing.expectEqual(Rcode.formerr, @as(Rcode, @enumFromInt(owners.flags.rcode)));
+}
+
+test "every record of a 65-value RRset is served over TCP and EDNS, or TC is set (review A4)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    f.soto(0);
+    const owner = "\x0f_acme-challenge\x07example\x03org\x00";
+    for (0..65) |i| {
+        var v: [3]u8 = .{ 2, 'a' + @as(u8, @intCast(i / 26)), 'a' + @as(u8, @intCast(i % 26)) };
+        try f.overlay.records.append(f.overlay.gpa, .{ .name = try f.overlay.gpa.dupe(u8, owner), .rdata = try f.overlay.gpa.dupe(u8, &v), .ttl = 60, .expires = 1 << 40 });
+    }
+    const name = "_acme-challenge.example.org.";
+    const tcp = try f.ask(.{ .name = name, .type = .txt, .transport = .tcp });
+    try testing.expect(!tcp.flags.tc);
+    try testing.expectEqual(@as(usize, 65), tcp.answer.len);
+    const edns = try f.ask(.{ .name = name, .type = .txt, .opt = .{ .payload = 1232 } });
+    try testing.expect(edns.answer.len == 65 or edns.flags.tc);
+    try testing.expectEqual(@as(usize, 65), edns.answer.len); // 65 short values fit in 1232 bytes
+    const plain = try f.ask(.{ .name = name, .type = .txt });
+    try testing.expect(plain.flags.tc and plain.answer.len < 65);
 }

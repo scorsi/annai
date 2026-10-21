@@ -31,6 +31,10 @@ const max_message = 65535;
 const idle_timeout_ms = 10_000; // RFC 7766 §6.2.3: a few seconds of idle time
 const max_messages_per_conn = 100;
 const max_conns = 64;
+/// Total time an answer may wait for a slow reader before the connection is closed (review A2).
+const write_timeout_ms = 5_000;
+/// Answer bytes kept for one connection: one local answer plus forwarded ones in flight.
+const max_pending_output = 2 * (2 + max_message);
 const backlog = 128;
 const max_pending = 256;
 const max_waiters = 64;
@@ -49,6 +53,12 @@ const Conn = struct {
     deadline: i64,
     len: usize = 0,
     messages: u32 = 0,
+    /// Answer bytes the socket has not taken yet, sent on write readiness; no new frame is
+    /// read meanwhile, so a slow reader stalls its own connection only (review A2).
+    pending: std.ArrayList(u8) = .empty,
+    /// The client shut its write half: what it asked is still answered, then the connection
+    /// closes (review A16).
+    eof: bool = false,
     buf: [2 + max_message]u8 = undefined,
 };
 
@@ -116,6 +126,8 @@ pub const Server = struct {
     soto: bool,
     mode: config.Mode,
     metrics: metrics.Metrics,
+    /// Index of the first TCP connection slot: listeners and the metrics slot come first (review A13).
+    first_conn: usize,
     /// Poller tokens `slots.len + i`.
     pending: [max_pending]?Pending = @splat(null),
     next_gen: u64 = 0,
@@ -127,15 +139,24 @@ pub const Server = struct {
 
     /// Binds every address (UDP and TCP) and serves forever.
     pub fn run(gpa: std.mem.Allocator, zones: []const zone.Zone, cfg: config.Config, keys: []const tsig.Key) !void {
+        const s = try init(gpa, zones, cfg, keys);
+        defer s.deinit();
+        while (true) try s.step(1000);
+    }
+
+    /// Binds every address of `cfg`; `deinit` closes them.
+    pub fn init(gpa: std.mem.Allocator, zones: []const zone.Zone, cfg: config.Config, keys: []const tsig.Key) !*Server {
         const listen = cfg.listen;
         const caps: config.Update = cfg.update orelse .{ .keys = &.{} };
         const s = try gpa.create(Server);
-        defer gpa.destroy(s);
         s.* = .{
             .gpa = gpa,
             .zones = zones,
-            .poller = try poll.Poller.init(),
-            .slots = try gpa.alloc(Slot, 2 * listen.len + 1 + max_conns),
+            .poller = poll.Poller.init() catch |e| {
+                gpa.destroy(s);
+                return e;
+            },
+            .slots = &.{},
             .arena = std.heap.ArenaAllocator.init(gpa),
             .forwarding = cfg.forwarding,
             .cache = .init(gpa, if (cfg.forwarding) |f| f.cache_bytes else 0),
@@ -143,14 +164,13 @@ pub const Server = struct {
             .overlay = .init(gpa, caps.max_ttl, caps.lifetime),
             .soto = cfg.mode == .soto,
             .mode = cfg.mode,
-            .metrics = try .init(gpa, if (cfg.forwarding) |f| f.upstreams.len else 0, keys.len),
+            .metrics = .{},
+            .first_conn = 2 * listen.len + 1,
         };
-        defer s.metrics.deinit(gpa);
-        defer gpa.free(s.slots);
-        defer s.arena.deinit();
-        defer s.cache.deinit();
-        defer s.overlay.deinit();
+        errdefer s.deinit();
+        s.slots = try gpa.alloc(Slot, s.first_conn + max_conns);
         @memset(s.slots, .free);
+        s.metrics = try .init(gpa, if (cfg.forwarding) |f| f.upstreams.len else 0, keys.len);
         for (listen, 0..) |addr, i| {
             const udp = try open(addr, posix.SOCK.DGRAM);
             s.slots[2 * i] = .{ .udp = udp };
@@ -166,35 +186,58 @@ pub const Server = struct {
             try s.poller.add(fd, 2 * listen.len);
             log.event(.info, "metrics-listen", .{ .addr = addr });
         }
+        return s;
+    }
+
+    pub fn deinit(s: *Server) void {
+        for (s.slots, 0..) |slot, i| switch (slot) {
+            .free => {},
+            .conn => s.close(i),
+            inline .udp, .listener, .scrape => |fd| _ = sys.close(fd),
+        };
+        for (&s.pending) |*p| if (p.*) |*q| {
+            s.closeUpstream(q);
+            q.waiters.deinit(s.gpa);
+        };
+        _ = sys.close(s.poller.fd);
+        s.metrics.deinit(s.gpa);
+        s.gpa.free(s.slots);
+        s.arena.deinit();
+        s.cache.deinit();
+        s.overlay.deinit();
+        s.gpa.destroy(s);
+    }
+
+    /// One turn of the event loop: waits up to `idle_ms` for events, handles them, then expires
+    /// dynamic records, connections past their deadline and upstream queries past theirs.
+    pub fn step(s: *Server, idle_ms: i32) !void {
         var events: [64]poll.Event = undefined;
-        while (true) {
-            // Upstream timeouts need a finer sweep than TCP idle ones.
-            const busy = for (s.pending) |p| {
-                if (p != null) break true;
-            } else false;
-            for (try s.poller.wait(&events, if (busy) 100 else 1000)) |ev| {
-                if (ev.token >= s.slots.len) {
-                    s.onUpstream(ev.token - s.slots.len);
-                    continue;
-                }
-                switch (s.slots[ev.token]) {
-                    .udp => |fd| s.serveUdp(fd),
-                    .listener => |fd| s.accept(fd),
-                    .conn => |*c| s.serveTcp(ev.token, c),
-                    .scrape => |fd| s.scrape(fd),
-                    .free => {},
-                }
+        // Upstream timeouts need a finer sweep than TCP idle ones.
+        const busy = for (s.pending) |p| {
+            if (p != null) break true;
+        } else false;
+        for (try s.poller.wait(&events, if (busy) @min(idle_ms, 100) else idle_ms)) |ev| {
+            if (ev.token >= s.slots.len) {
+                s.onUpstream(ev.token - s.slots.len);
+                continue;
             }
-            const now = nowMs();
-            s.overlay.expire(@divTrunc(now, 1000));
-            for (s.slots, 0..) |slot, i| if (slot == .conn and slot.conn.deadline <= now) s.close(i);
-            for (&s.pending, 0..) |*p, i| if (p.* != null and p.*.?.deadline <= now) {
-                const u = p.*.?.upstream;
-                log.event(.warn, "upstream-timeout", .{ .upstream = s.forwarding.?.upstreams[u], .qname = zone.fmt(p.*.?.qname()), .qtype = log.typeName(p.*.?.type) });
-                s.metrics.upstream(u, .timeout);
-                s.attempt(i, p.*.?.upstream + 1);
-            };
+            switch (s.slots[ev.token]) {
+                .udp => |fd| s.serveUdp(fd),
+                .listener => |fd| s.accept(fd),
+                .conn => |*c| s.serveTcp(ev.token, c),
+                .scrape => |fd| s.scrape(fd),
+                .free => {},
+            }
         }
+        const now = nowMs();
+        s.overlay.expire(@divTrunc(now, 1000));
+        for (s.slots, 0..) |slot, i| if (slot == .conn and slot.conn.deadline <= now) s.close(i);
+        for (&s.pending, 0..) |*p, i| if (p.* != null and p.*.?.deadline <= now) {
+            const u = p.*.?.upstream;
+            log.event(.warn, "upstream-timeout", .{ .upstream = s.forwarding.?.upstreams[u], .qname = zone.fmt(p.*.?.qname()), .qtype = log.typeName(p.*.?.type) });
+            s.metrics.upstream(u, .timeout);
+            s.attempt(i, p.*.?.upstream + 1);
+        };
     }
 
     fn respond(s: *Server, packet: []const u8, to: ReplyTo, a: Asker) ?[]const u8 {
@@ -352,25 +395,35 @@ pub const Server = struct {
     fn complete(s: *Server, i: usize, packet: ?[]const u8, ttl: u32) void {
         const p = &s.pending[i].?;
         s.closeUpstream(p);
-        for (p.waiters.items) |*w| {
+        var waiters = p.waiters;
+        defer waiters.deinit(s.gpa);
+        s.pending[i] = null;
+        for (waiters.items) |*w| {
             const n = engine.forwarded(s.arena.allocator(), w.forward(), packet, ttl, s.out[2..]);
             s.answered(w.asker, s.out[2 .. 2 + n], s.out[2 .. 2 + n], .miss);
             s.deliver(w.to, s.out[2 .. 2 + n]);
         }
-        p.waiters.deinit(s.gpa);
-        s.pending[i] = null;
+        // A client that already sent its EOF may now be owed nothing more.
+        for (waiters.items) |w| if (w.to == .tcp) if (s.conn(w.to.tcp.token, w.to.tcp.gen)) |c| if (c.eof) s.settle(w.to.tcp.token);
+    }
+
+    /// The connection in slot `token` if it is still generation `gen`.
+    fn conn(s: *Server, token: usize, gen: u64) ?*Conn {
+        const slot = &s.slots[token];
+        return if (slot.* == .conn and slot.conn.gen == gen) &slot.conn else null;
+    }
+
+    /// Whether a forwarded answer is still due to connection `token`/`gen`.
+    fn awaited(s: *const Server, token: usize, gen: u64) bool {
+        for (s.pending) |p| if (p) |q| for (q.waiters.items) |w| if (w.to == .tcp and w.to.tcp.token == token and w.to.tcp.gen == gen) return true;
+        return false;
     }
 
     /// Sends an answer that was not written in reply to the packet being read.
     fn deliver(s: *Server, to: ReplyTo, reply: []const u8) void {
         switch (to) {
             .udp => |u| _ = sys.sendto(u.fd, reply.ptr, reply.len, 0, &u.peer.any, u.len),
-            .tcp => |t| {
-                const slot = s.slots[t.token];
-                if (slot != .conn or slot.conn.gen != t.gen) return; // the client left
-                std.mem.writeInt(u16, s.out[0..2], @intCast(reply.len), .big);
-                sendAll(slot.conn.fd, s.out[0 .. 2 + reply.len]) catch s.close(t.token);
-            },
+            .tcp => |t| if (s.conn(t.token, t.gen) != null) s.send(t.token, reply), // else the client left
         }
     }
 
@@ -392,7 +445,8 @@ pub const Server = struct {
     fn accept(s: *Server, fd: posix.fd_t) void {
         var peer: PosixAddress = undefined;
         const cfd = acceptConn(fd, &peer) orelse return;
-        const slot = for (s.slots, 0..) |slot, i| {
+        // Only the connection range: the metrics slot stays free when metrics are off (review A13).
+        const slot = for (s.slots[s.first_conn..], s.first_conn..) |slot, i| {
             if (slot == .free) break i;
         } else {
             log.event(.warn, "tcp-refused", .{ .reason = "connection-cap" });
@@ -405,6 +459,8 @@ pub const Server = struct {
     }
 
     fn serveTcp(s: *Server, token: usize, c: *Conn) void {
+        if (c.pending.items.len > 0) return s.flush(token, c);
+        if (c.eof) return s.close(token); // a hangup or an error: nothing more can be sent
         const rc = sys.recvfrom(c.fd, c.buf[c.len..].ptr, c.buf.len - c.len, 0, null, null);
         switch (posix.errno(rc)) {
             .SUCCESS => {},
@@ -412,21 +468,63 @@ pub const Server = struct {
             else => return s.close(token),
         }
         const n: usize = @intCast(rc);
-        if (n == 0) return s.close(token); // peer closed
+        if (n == 0) { // the client is done asking; an incomplete last frame is dropped
+            c.eof = true;
+            return s.settle(token);
+        }
         c.len += n;
         c.deadline = nowMs() + idle_timeout_ms;
-        while (frameEnd(c.buf[0..c.len])) |end| {
+        s.frames(token, c);
+    }
+
+    /// Answers the complete frames read so far, while the socket takes the answers.
+    fn frames(s: *Server, token: usize, c: *Conn) void {
+        while (c.pending.items.len == 0) {
+            const end = frameEnd(c.buf[0..c.len]) orelse return;
             c.messages += 1;
             if (c.messages > max_messages_per_conn) return s.close(token);
-            if (s.respond(c.buf[2..end], .{ .tcp = .{ .token = token, .gen = c.gen } }, .{ .proto = .tcp, .client = c.peer, .start = nowNs() })) |reply| {
-                std.mem.writeInt(u16, s.out[0..2], @intCast(reply.len), .big);
-                sendAll(c.fd, s.out[0 .. 2 + reply.len]) catch return s.close(token);
-            }
-            // A SERVFAIL delivered while forwarding may have closed this connection.
+            if (s.respond(c.buf[2..end], .{ .tcp = .{ .token = token, .gen = c.gen } }, .{ .proto = .tcp, .client = c.peer, .start = nowNs() })) |reply| s.send(token, reply);
+            // The answer, or a SERVFAIL delivered while forwarding, may have closed this connection.
             if (s.slots[token] != .conn) return;
             std.mem.copyForwards(u8, &c.buf, c.buf[end..c.len]);
             c.len -= end;
         }
+    }
+
+    /// Sends `reply` (in `s.out` after two free bytes) length-prefixed on connection `token`;
+    /// what the socket does not take now waits in `pending` under a total deadline (review A2).
+    fn send(s: *Server, token: usize, reply: []const u8) void {
+        std.debug.assert(reply.ptr == s.out[2..].ptr);
+        const c = &s.slots[token].conn;
+        std.mem.writeInt(u16, s.out[0..2], @intCast(reply.len), .big);
+        var data: []const u8 = s.out[0 .. 2 + reply.len];
+        if (c.pending.items.len == 0) {
+            data = data[sendSome(c.fd, data) orelse return s.close(token) ..];
+            if (data.len == 0) return;
+            c.deadline = @min(c.deadline, nowMs() + write_timeout_ms);
+            s.poller.set(c.fd, token, .write) catch return s.close(token);
+        }
+        if (c.pending.items.len + data.len > max_pending_output) return s.close(token);
+        c.pending.appendSlice(s.gpa, data) catch return s.close(token);
+    }
+
+    /// Write readiness: sends what is pending, then reads again (or settles after an EOF).
+    fn flush(s: *Server, token: usize, c: *Conn) void {
+        const sent = sendSome(c.fd, c.pending.items) orelse return s.close(token);
+        c.pending.replaceRangeAssumeCapacity(0, sent, &.{});
+        if (c.pending.items.len > 0) return;
+        c.deadline = nowMs() + idle_timeout_ms;
+        if (c.eof) return s.settle(token);
+        s.poller.set(c.fd, token, .read) catch return s.close(token);
+        s.frames(token, c);
+    }
+
+    /// After the client's EOF: closes once every answer it is owed is written (review A16).
+    fn settle(s: *Server, token: usize) void {
+        const c = &s.slots[token].conn;
+        if (c.pending.items.len > 0) return; // `flush` settles again
+        if (!s.awaited(token, c.gen)) return s.close(token);
+        s.poller.set(c.fd, token, .none) catch s.close(token);
     }
 
     /// One `GET /metrics` (ADR 0011), answered on the spot and closed.
@@ -466,14 +564,15 @@ pub const Server = struct {
             if (ok) metrics.content_type else "text/plain; charset=utf-8",
             body.written().len,
         }) catch unreachable;
-        sendAll(fd, h) catch return;
-        sendAll(fd, body.written()) catch return;
+        sendAll(fd, h, deadline) catch return;
+        sendAll(fd, body.written(), deadline) catch return;
     }
 
     fn close(s: *Server, token: usize) void {
-        const fd = s.slots[token].conn.fd;
-        s.poller.remove(fd);
-        _ = sys.close(fd);
+        const c = &s.slots[token].conn;
+        s.poller.remove(c.fd);
+        _ = sys.close(c.fd);
+        c.pending.deinit(s.gpa);
         s.slots[token] = .free;
     }
 };
@@ -514,22 +613,29 @@ const Host = struct {
     }
 };
 
-/// Writes the whole buffer; when the socket buffer is full, waits for it up to one second.
-fn sendAll(fd: posix.fd_t, data: []const u8) error{Closed}!void {
+/// Writes what a non-blocking socket takes now; null when the connection is gone.
+fn sendSome(fd: posix.fd_t, data: []const u8) ?usize {
     var sent: usize = 0;
     while (sent < data.len) {
         const rc = sys.sendto(fd, data[sent..].ptr, data.len - sent, 0, null, 0);
         switch (posix.errno(rc)) {
             .SUCCESS => sent += @intCast(rc),
             .INTR => {},
-            // shortcut: this blocks the loop for a slow client; upgrade to write-readiness events if TCP ever carries volume.
-            .AGAIN => {
-                var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-                const ready = posix.poll(&fds, 1000) catch return error.Closed;
-                if (ready == 0) return error.Closed;
-            },
-            else => return error.Closed,
+            .AGAIN => break,
+            else => return null,
         }
+    }
+    return sent;
+}
+
+/// Writes the whole buffer, waiting for the socket until `deadline` at most (a total bound,
+/// review A2). Blocks the loop: only for the loopback scraper and the TCP upstream exchange.
+fn sendAll(fd: posix.fd_t, data: []const u8, deadline: i64) error{Closed}!void {
+    var sent: usize = 0;
+    while (true) {
+        sent += sendSome(fd, data[sent..]) orelse return error.Closed;
+        if (sent == data.len) return;
+        if (!waitFd(fd, posix.POLL.OUT, deadline)) return error.Closed;
     }
 }
 
@@ -599,7 +705,7 @@ fn connectUdp(addr: net.IpAddress, query: []const u8) !posix.fd_t {
 }
 
 /// One length-prefixed query over TCP to `addr`, the answer read into `buf` (RFC 7766).
-/// shortcut: blocks the loop up to the upstream timeout; upgrade to poller write-readiness if TC answers become frequent.
+/// shortcut: blocks the loop up to the upstream timeout in total (connect, send and receive); upgrade to poller readiness if TC answers become frequent.
 fn tcpExchange(addr: net.IpAddress, query: []const u8, buf: []u8) ?[]const u8 {
     const deadline = nowMs() + upstream_timeout_ms;
     const fd = socket(addr, posix.SOCK.STREAM) catch return null;
@@ -615,7 +721,7 @@ fn tcpExchange(addr: net.IpAddress, query: []const u8, buf: []u8) ?[]const u8 {
         },
         else => return null,
     }
-    sendAll(fd, query) catch return null;
+    sendAll(fd, query, deadline) catch return null;
     var got: usize = 0;
     while (frameEnd(buf[0..got]) == null) {
         const rc = sys.recvfrom(fd, buf[got..].ptr, buf.len - got, 0, null, null);
@@ -703,4 +809,338 @@ test "TCP framing: a 0xffff length prefix waits for more bytes instead of overfl
     try std.testing.expectEqual(@as(?usize, full.len), frameEnd(&full));
     try std.testing.expectEqual(@as(?usize, null), frameEnd(&.{0}));
     try std.testing.expectEqual(@as(?usize, 3), frameEnd(&.{ 0, 1, 9, 0, 0 }));
+}
+
+// ---- loopback harness and stateful tests (review A2, A13, A16, A17) ----------------------------
+
+const testing = std.testing;
+
+/// A server on an ephemeral 127.0.0.1 port, driven one `step` at a time by the caller, with
+/// non-blocking clients: the stateful tests below and the `tcp` target of src/fuzz.zig.
+pub const Loopback = struct {
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    zones: [1]zone.Zone,
+    server: *Server,
+    /// The TCP listener's address; port 0 gave the UDP socket another port.
+    addr: net.IpAddress,
+    udp_addr: net.IpAddress,
+
+    /// engine.test_zone plus `huge`: a TXT RRset of about 64 KiB, many times a socket buffer.
+    const huge_zone = engine.test_zone ++ "[names.\"huge\"]\ntxt = [\n" ++ ("\"" ++ "h" ** 255 ++ "\",\n") ** 240 ++ "]\n";
+
+    pub const Options = struct { forwarding: ?config.Forwarding = null, metrics: bool = false };
+
+    pub fn init(gpa: std.mem.Allocator, opts: Options) !*Loopback {
+        // A client that hangs up must not kill the process that runs the server (the binary
+        // gets the same from Zig's start code).
+        var ignore: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
+        posix.sigaction(posix.SIG.PIPE, &ignore, null);
+        const l = try gpa.create(Loopback);
+        errdefer gpa.destroy(l);
+        l.* = .{ .gpa = gpa, .arena = .init(gpa), .zones = undefined, .server = undefined, .addr = undefined, .udp_addr = undefined };
+        errdefer l.arena.deinit();
+        const a = l.arena.allocator();
+        var d: config.Diag = .{};
+        l.zones[0] = try config.loadZone(a, huge_zone, &d);
+        const any = try net.IpAddress.parse("127.0.0.1", 0);
+        const fwd: ?config.Forwarding = if (opts.forwarding) |f| .{ .upstreams = try a.dupe(net.IpAddress, f.upstreams), .min_ttl = f.min_ttl, .max_ttl = f.max_ttl, .cache_bytes = f.cache_bytes } else null;
+        l.server = try Server.init(gpa, &l.zones, .{ .mode = .uchi, .listen = &.{any}, .zones = &.{}, .forwarding = fwd, .metrics = if (opts.metrics) any else null }, &.{});
+        l.addr = try net.IpAddress.parse("127.0.0.1", localPort(l.server.slots[1].listener));
+        l.udp_addr = try net.IpAddress.parse("127.0.0.1", localPort(l.server.slots[0].udp));
+        return l;
+    }
+
+    pub fn deinit(l: *Loopback) void {
+        l.server.deinit();
+        l.arena.deinit();
+        l.gpa.destroy(l);
+    }
+
+    /// A connected, non-blocking TCP client.
+    pub fn connect(l: *Loopback) !posix.fd_t {
+        const fd = try clientSocket(l.addr, posix.SOCK.STREAM);
+        errdefer _ = sys.close(fd);
+        var storage: PosixAddress = undefined;
+        switch (posix.errno(sys.connect(fd, &storage.any, sockaddr(l.addr, &storage)))) {
+            .SUCCESS => {},
+            // The kernel completes the handshake without the server's accept.
+            .INPROGRESS => if (!waitFd(fd, posix.POLL.OUT, nowMs() + 1000)) return error.Connect,
+            else => return error.Connect,
+        }
+        return fd;
+    }
+
+    /// Open TCP connections on the server.
+    pub fn conns(l: *const Loopback) usize {
+        var n: usize = 0;
+        for (l.server.slots) |slot| n += @intFromBool(slot == .conn);
+        return n;
+    }
+
+    /// Sends `stream` over one connection in chunks `rand` picks, then shuts the write half and
+    /// reads until the server closes. Invariants (review A17): no trap; only complete frames are
+    /// answered, each once, in order, with a well-formed response; the 101st message closes the
+    /// connection; the slot is released.
+    pub fn checkStream(l: *Loopback, stream: []const u8, rand: std.Random) error{Stream}!void {
+        var want: [max_messages_per_conn]u16 = undefined;
+        var n_want: usize = 0;
+        var capped = false;
+        var rest = stream;
+        var frames_seen: usize = 0;
+        while (frameEnd(rest)) |end| : (rest = rest[end..]) {
+            frames_seen += 1;
+            if (frames_seen > max_messages_per_conn) {
+                capped = true;
+                break;
+            }
+            const msg = rest[2..end];
+            if (msg.len >= 12 and msg[2] & 0x80 == 0) { // engine.respond answers every non-response of a header or more
+                want[n_want] = std.mem.readInt(u16, msg[0..2], .big);
+                n_want += 1;
+            }
+        }
+        const fd = l.connect() catch return error.Stream;
+        defer _ = sys.close(fd);
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(l.gpa);
+        var sent: usize = 0;
+        var shut = false;
+        var turns: usize = 0;
+        var buf: [16384]u8 = undefined;
+        while (true) : (turns += 1) {
+            if (turns > 100_000) return error.Stream; // the server never closed the connection
+            if (sent < stream.len) {
+                const chunk = 1 + rand.uintLessThan(usize, @min(stream.len - sent, 4096));
+                const rc = sys.sendto(fd, stream[sent..].ptr, chunk, 0, null, 0);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => sent += @intCast(rc),
+                    .AGAIN, .INTR, .NOTCONN => {},
+                    else => sent = stream.len, // the server closed it (message cap)
+                }
+            } else if (!shut) {
+                _ = sys.shutdown(fd, posix.SHUT.WR);
+                shut = true;
+            }
+            l.server.step(0) catch return error.Stream;
+            const rc = sys.recvfrom(fd, &buf, buf.len, 0, null, null);
+            switch (posix.errno(rc)) {
+                .SUCCESS => if (rc == 0) break else got.appendSlice(l.gpa, buf[0..@intCast(rc)]) catch return error.Stream,
+                .AGAIN, .INTR => {},
+                else => if (capped) break else return error.Stream, // a reset: unread input at close
+            }
+        }
+        var answers: []const u8 = got.items;
+        var i: usize = 0;
+        var arena = std.heap.ArenaAllocator.init(l.gpa);
+        defer arena.deinit();
+        while (frameEnd(answers)) |end| : (answers = answers[end..]) {
+            const m = wire.Message.parse(arena.allocator(), answers[2..end]) catch return error.Stream;
+            if (i == n_want or !m.flags.qr or m.id != want[i]) return error.Stream;
+            i += 1;
+        }
+        // A reset may cut what the cap left in flight; otherwise every answer is there, whole.
+        if (!capped and (i != n_want or answers.len != 0)) return error.Stream;
+        if (l.conns() != 0) return error.Stream;
+    }
+};
+
+fn clientSocket(addr: net.IpAddress, kind: u32) !posix.fd_t {
+    return socket(addr, kind);
+}
+
+fn localPort(fd: posix.fd_t) u16 {
+    var storage: PosixAddress = undefined;
+    var len: posix.socklen_t = @sizeOf(PosixAddress);
+    _ = sys.getsockname(fd, &storage.any, &len);
+    return std.mem.bigToNative(u16, storage.in.port);
+}
+
+/// A query frame (length prefix included) for `name`/`type` with `id`.
+fn queryFrame(buf: []u8, id: u16, name: []const u8, t: wire.Type) []const u8 {
+    var nbuf: [255]u8 = undefined;
+    const m: wire.Message = .{ .id = id, .flags = .{ .rd = true }, .question = &.{.{ .name = wire.nameFromText(&nbuf, name) catch unreachable, .type = t }} };
+    const n = m.encode(buf[2..]) catch unreachable;
+    std.mem.writeInt(u16, buf[0..2], @intCast(n), .big);
+    return buf[0 .. 2 + n];
+}
+
+/// Reads into `got` until `want` bytes arrived, stepping the server; false on EOF or no progress.
+fn readSome(l: *Loopback, fd: posix.fd_t, got: *std.ArrayList(u8), want: usize) !bool {
+    var buf: [4096]u8 = undefined;
+    for (0..10_000) |_| {
+        if (got.items.len >= want) return true;
+        try l.server.step(0);
+        const rc = sys.recvfrom(fd, &buf, buf.len, 0, null, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => if (rc == 0) return false else try got.appendSlice(testing.allocator, buf[0..@intCast(rc)]),
+            .AGAIN, .INTR => {},
+            else => return false,
+        }
+    }
+    return false;
+}
+
+test "a client that does not read stalls only its own connection, within a total deadline (review A2)" {
+    const l = try Loopback.init(testing.allocator, .{});
+    defer l.deinit();
+    const slow = try l.connect();
+    defer _ = sys.close(slow);
+    const small = std.mem.toBytes(@as(c_int, 4096));
+    try posix.setsockopt(slow, posix.SOL.SOCKET, posix.SO.RCVBUF, &small);
+    // 100 pipelined queries for a 64 KiB RRset, never read: megabytes of answers.
+    var qbuf: [512]u8 = undefined;
+    for (0..100) |i| {
+        const q = queryFrame(&qbuf, @intCast(i), "huge.uchi.example.org.", .txt);
+        try testing.expectEqual(@as(isize, @intCast(q.len)), @as(isize, @bitCast(sys.sendto(slow, q.ptr, q.len, 0, null, 0))));
+    }
+    // No turn of the loop waits on the slow reader (sendAll waited up to 1 s per full buffer).
+    var token: ?usize = null;
+    for (0..1000) |_| {
+        const t0 = nowMs();
+        try l.server.step(0);
+        try testing.expect(nowMs() - t0 < 200);
+        for (l.server.slots, 0..) |slot, i| if (slot == .conn and slot.conn.pending.items.len > 0) {
+            token = i;
+        };
+        if (token != null) break;
+    }
+    const c = &l.server.slots[token.?].conn;
+    try testing.expect(c.messages < 100); // reading paused behind the pending answer
+    try testing.expect(c.deadline <= nowMs() + write_timeout_ms);
+    // A UDP client is answered meanwhile.
+    const udp = try clientSocket(l.addr, posix.SOCK.DGRAM);
+    defer _ = sys.close(udp);
+    var storage: PosixAddress = undefined;
+    const q = queryFrame(&qbuf, 7, "hub.kekkai.uchi.example.org.", .a)[2..];
+    _ = sys.sendto(udp, q.ptr, q.len, 0, &storage.any, sockaddr(l.udp_addr, &storage));
+    var answer: [512]u8 = undefined;
+    const n = for (0..1000) |_| {
+        try l.server.step(0);
+        const rc = sys.recvfrom(udp, &answer, answer.len, 0, null, null);
+        if (posix.errno(rc) == .SUCCESS) break @as(usize, @intCast(rc));
+    } else return error.NoAnswer;
+    try testing.expectEqual(@as(u16, 7), std.mem.readInt(u16, answer[0..2], .big));
+    try testing.expect(n > 12);
+    // Past its deadline the connection is closed and its slot released.
+    c.deadline = 0;
+    try l.server.step(0);
+    try testing.expectEqual(@as(usize, 0), l.conns());
+}
+
+test "the TCP connection cap is 64 with and without the metrics listener (review A13)" {
+    for ([_]bool{ false, true }) |with_metrics| {
+        const l = try Loopback.init(testing.allocator, .{ .metrics = with_metrics });
+        defer l.deinit();
+        var clients: [max_conns + 1]posix.fd_t = undefined;
+        for (&clients) |*fd| fd.* = try l.connect();
+        defer for (clients) |fd| {
+            _ = sys.close(fd);
+        };
+        for (0..4 * clients.len) |_| try l.server.step(0);
+        try testing.expectEqual(@as(usize, max_conns), l.conns());
+    }
+}
+
+test "a TCP client's EOF does not drop the forwarded answer it is owed (review A16)" {
+    // A fake upstream that answers only when the test says so.
+    const any = try net.IpAddress.parse("127.0.0.1", 0);
+    const up = try open(any, posix.SOCK.DGRAM);
+    defer _ = sys.close(up);
+    const up_addr = try net.IpAddress.parse("127.0.0.1", localPort(up));
+    const l = try Loopback.init(testing.allocator, .{ .forwarding = .{ .upstreams = &.{up_addr} } });
+    defer l.deinit();
+    const fd = try l.connect();
+    defer _ = sys.close(fd);
+    var qbuf: [512]u8 = undefined;
+    const q = queryFrame(&qbuf, 0x4242, "www.example.net.", .a);
+    _ = sys.sendto(fd, q.ptr, q.len, 0, null, 0);
+    _ = sys.shutdown(fd, posix.SHUT.WR);
+    var ubuf: [512]u8 = undefined;
+    var peer: PosixAddress = undefined;
+    var peer_len: posix.socklen_t = @sizeOf(PosixAddress);
+    const n = for (0..1000) |_| {
+        try l.server.step(0);
+        const rc = sys.recvfrom(up, &ubuf, ubuf.len, 0, &peer.any, &peer_len);
+        if (posix.errno(rc) == .SUCCESS) break @as(usize, @intCast(rc));
+    } else return error.NoUpstreamQuery;
+    for (0..50) |_| try l.server.step(0); // the EOF is read while the upstream is silent
+    try testing.expectEqual(@as(usize, 1), l.conns());
+    // The upstream answers: the client still gets it, then the connection closes.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const asked = try wire.Message.parse(arena.allocator(), ubuf[0..n]);
+    const reply: wire.Message = .{ .id = asked.id, .flags = .{ .qr = true, .rd = true, .ra = true }, .question = asked.question, .answer = &.{.{ .name = asked.question[0].name, .type = .a, .ttl = 60, .rdata = "\xc0\x00\x02\x01" }} };
+    var rbuf: [512]u8 = undefined;
+    const rlen = try reply.encode(&rbuf);
+    _ = sys.sendto(up, &rbuf, rlen, 0, &peer.any, peer_len);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    try testing.expect(try readSome(l, fd, &got, 2));
+    const end = frameEnd(got.items) orelse blk: {
+        try testing.expect(try readSome(l, fd, &got, 2 + @as(usize, std.mem.readInt(u16, got.items[0..2], .big))));
+        break :blk frameEnd(got.items).?;
+    };
+    const m = try wire.Message.parse(arena.allocator(), got.items[2..end]);
+    try testing.expect(m.id == 0x4242 and m.flags.qr and m.answer.len == 1);
+    try testing.expect(!try readSome(l, fd, &got, end + 1)); // then EOF
+    try testing.expectEqual(@as(usize, 0), l.conns());
+}
+
+/// Frames and garbage as a client could send them: valid queries, short and empty messages,
+/// responses, junk that shifts the framing, and incomplete 0xfffe/0xffff prefixes.
+fn randomStream(r: std.Random, buf: []u8) []const u8 {
+    var len: usize = 0;
+    const pieces = r.uintLessThan(usize, 120);
+    for (0..pieces) |_| {
+        if (buf.len - len < 70000 - 65537) break;
+        switch (r.uintLessThan(u8, 8)) {
+            0, 1, 2 => len += queryFrame(buf[len..], r.int(u16), if (r.boolean()) "hub.kekkai.uchi.example.org." else "big.uchi.example.org.", if (r.boolean()) .a else .txt).len,
+            3 => { // a frame of 0, 1, 11 or 12 to 40 random bytes, possibly a response
+                const n: usize = switch (r.uintLessThan(u8, 4)) {
+                    0 => 0,
+                    1 => 1,
+                    2 => 11,
+                    else => 12 + r.uintLessThan(usize, 29),
+                };
+                std.mem.writeInt(u16, buf[len..][0..2], @intCast(n), .big);
+                r.bytes(buf[len + 2 ..][0..n]);
+                len += 2 + n;
+            },
+            4 => { // junk that shifts the framing
+                const n = 1 + r.uintLessThan(usize, 32);
+                r.bytes(buf[len..][0..n]);
+                len += n;
+            },
+            5 => { // a prefix announcing a frame that never completes
+                std.mem.writeInt(u16, buf[len..][0..2], if (r.boolean()) 0xfffe else 0xffff, .big);
+                len += 2 + r.uintLessThan(usize, 64);
+                return buf[0..len];
+            },
+            else => len += queryFrame(buf[len..], r.int(u16), "nope.uchi.example.org.", .aaaa).len,
+        }
+    }
+    return buf[0..len];
+}
+
+test "TCP framing and connection state under random streams split at random points (review A17)" {
+    const l = try Loopback.init(testing.allocator, .{});
+    defer l.deinit();
+    var prng = std.Random.DefaultPrng.init(0xa17);
+    const r = prng.random();
+    const buf = try testing.allocator.alloc(u8, 70000);
+    defer testing.allocator.free(buf);
+    @memset(buf, 0);
+    for (0..100) |_| try l.checkStream(randomStream(r, buf), r);
+    // Boundaries: empty and 1-byte streams, 0/1/11-byte messages, 0xfffe/0xffff prefixes, a whole 65535-byte frame.
+    for ([_][]const u8{ "", "\x00", "\x00\x00", "\x00\x01\x00", "\x00\x0b" ++ "\x00" ** 11, "\xff\xfe", "\xff\xff" ++ "\x00" ** 100 }) |s| try l.checkStream(s, r);
+    var full: [2 + max_message]u8 = @splat(0);
+    std.mem.writeInt(u16, full[0..2], max_message, .big);
+    try l.checkStream(&full, r);
+    // The message cap: 100 answered, the 101st closes the connection.
+    for ([_]usize{ 100, 101 }) |count| {
+        var len: usize = 0;
+        for (0..count) |i| len += queryFrame(buf[len..], @intCast(i), "hub.kekkai.uchi.example.org.", .a).len;
+        try l.checkStream(buf[0..len], r);
+    }
 }

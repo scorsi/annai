@@ -1,11 +1,13 @@
-//! The poller of ADR 0001: readiness-to-read events from kqueue (macOS) or epoll (Linux), behind
-//! one small interface. Each registered descriptor carries a caller token.
+//! The poller of ADR 0001: readiness events from kqueue (macOS) or epoll (Linux), behind one small
+//! interface. Each registered descriptor carries a caller token and waits for one thing at a
+//! time: input (the default), room to write (a TCP answer the socket did not take), or nothing.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
 pub const Event = struct { token: usize };
+pub const Interest = enum { read, write, none };
 
 pub const Poller = switch (builtin.os.tag) {
     .linux => Epoll,
@@ -44,6 +46,17 @@ const Epoll = struct {
         _ = linux.epoll_ctl(p.fd, linux.EPOLL.CTL_DEL, fd, null);
     }
 
+    /// What a registered descriptor waits for from now on.
+    pub fn set(p: *Epoll, fd: posix.fd_t, token: usize, interest: Interest) Error!void {
+        const events: u32 = switch (interest) {
+            .read => linux.EPOLL.IN,
+            .write => linux.EPOLL.OUT,
+            .none => 0, // hangups and errors are still reported
+        };
+        var ev: linux.epoll_event = .{ .events = events, .data = .{ .ptr = token } };
+        try check(linux.epoll_ctl(p.fd, linux.EPOLL.CTL_MOD, fd, &ev));
+    }
+
     /// Blocks up to `timeout_ms` (-1 forever); returns the ready events.
     pub fn wait(p: *Epoll, events: []Event, timeout_ms: i32) Error![]Event {
         var raw: [64]linux.epoll_event = undefined;
@@ -74,8 +87,22 @@ const Kqueue = struct {
     }
 
     pub fn remove(p: *Kqueue, fd: posix.fd_t) void {
-        var change = [_]c.Kevent{.{ .ident = @intCast(fd), .filter = c.EVFILT.READ, .flags = c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 }};
-        _ = c.kevent(p.fd, &change, 1, &change, 0, null);
+        // One call per filter: the write filter may never have been added.
+        for ([_]i16{ c.EVFILT.READ, c.EVFILT.WRITE }) |filter| {
+            var change = [_]c.Kevent{.{ .ident = @intCast(fd), .filter = filter, .flags = c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 }};
+            _ = c.kevent(p.fd, &change, 1, &change, 0, null);
+        }
+    }
+
+    /// What a registered descriptor waits for from now on.
+    pub fn set(p: *Kqueue, fd: posix.fd_t, token: usize, interest: Interest) Error!void {
+        const on = c.EV.ADD | c.EV.ENABLE;
+        const off = c.EV.ADD | c.EV.DISABLE;
+        var changes = [_]c.Kevent{
+            .{ .ident = @intCast(fd), .filter = c.EVFILT.READ, .flags = if (interest == .read) on else off, .fflags = 0, .data = 0, .udata = token },
+            .{ .ident = @intCast(fd), .filter = c.EVFILT.WRITE, .flags = if (interest == .write) on else off, .fflags = 0, .data = 0, .udata = token },
+        };
+        try check(c.kevent(p.fd, &changes, changes.len, &changes, 0, null));
     }
 
     pub fn wait(p: *Kqueue, events: []Event, timeout_ms: i32) Error![]Event {

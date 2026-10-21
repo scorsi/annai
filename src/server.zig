@@ -1167,8 +1167,9 @@ test "three maximum forwarded replies drain an unwritable TCP connection without
     const c = &s.slots[token].conn;
     const small = std.mem.toBytes(@as(c_int, 4096));
     try posix.setsockopt(c.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &small);
-    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &small);
-    // Fill the kernel buffer first; the client deliberately reads nothing until completion.
+    // The client's RCVBUF stays as connected: Linux never shrinks a window it already advertised,
+    // so a smaller one now drops in-flight data and stalls the drain on retransmission timers.
+    // Fill the kernel buffers first; the client deliberately reads nothing until completion.
     const padding: [16384]u8 = @splat(0);
     var padded: usize = 0;
     for (0..1024) |_| {

@@ -281,7 +281,9 @@ pub const Server = struct {
     }
 
     /// Answers from the cache, or joins or starts the upstream query; null when the answer comes later.
-    fn forwardQuery(s: *Server, f: engine.Forward, to: ReplyTo, a: Asker, cache: *CacheUse) ?[]const u8 {
+    fn forwardQuery(s: *Server, query: engine.Forward, to: ReplyTo, a: Asker, cache: *CacheUse) ?[]const u8 {
+        var f = query; // the waiters keep the cap for answers that come later
+        f.max_ttl = s.forwarding.?.max_ttl;
         var lowered: [255]u8 = undefined;
         @memcpy(lowered[0..f.question.name.len], f.question.name);
         const qname = zone.lower(lowered[0..f.question.name.len]);

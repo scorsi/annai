@@ -74,11 +74,14 @@ pkgs.testers.runNixOSTest {
           out = q("+short example.org CAA")
           assert '0 issue "letsencrypt.org"' in out, out
 
-      with subtest("add over UDP: TTL capped at 120, the names above the challenge exist (NODATA)"):
+      with subtest("add over UDP: TTL capped by max-ttl and the remaining lifetime, the names above the challenge exist (NODATA)"):
           out = nsupdate(f"update add {challenge} 3600 TXT tok1")
           assert "failed" not in out, out
           out = q(f"+noall +answer {challenge} TXT")
-          assert re.search(rf"{challenge}\.\s+120\s+IN\s+TXT\s+\"tok1\"", out), out
+          m = re.search(rf"{challenge}\.\s+(\d+)\s+IN\s+TXT\s+\"tok1\"", out)
+          assert m, out
+          # min(max-ttl 120, lifetime 15 minus the seconds since the add), review A12; 120 itself is unit-tested.
+          assert 0 < int(m.group(1)) <= 15, out
           for name in ["git.uchi.example.org", "uchi.example.org"]:
               out = q(f"+noall +comments {name} A")
               assert "status: NOERROR" in out and "ANSWER: 0" in out, out

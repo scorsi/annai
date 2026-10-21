@@ -47,6 +47,8 @@ pub const Forward = struct {
     opt: ?wire.Opt,
     /// Bytes the transport allows for the answer.
     limit: usize,
+    /// `forwarding.max_ttl`: no served TTL exceeds it (ADR 0008, 0012).
+    max_ttl: u32 = std.math.maxInt(u32),
 };
 
 /// Writes the response to `query` into `out` and returns its length, or null when the packet
@@ -203,7 +205,7 @@ pub fn forwarded(arena: std.mem.Allocator, f: Forward, upstream: ?[]const u8, ag
         dst.* = arena.alloc(wire.RR, src.len) catch return r.finish(f.id, out, .servfail).?;
         for (src) |rr| if (rr.type != .opt) { // the upstream's OPT is not the client's
             dst.*[n] = rr;
-            const bound = if (rr.type == .soa) @min(rr.ttl, forwarding.negativeTtl(m) orelse rr.ttl) else rr.ttl;
+            const bound = @min(f.max_ttl, if (rr.type == .soa) @min(rr.ttl, forwarding.negativeTtl(m) orelse rr.ttl) else rr.ttl);
             dst.*[n].ttl = bound -| age;
             n += 1;
         };
@@ -909,6 +911,26 @@ test "review A5: forwarding ages each record without extending its TTL" {
         try testing.expectEqual(@as(u32, 297), aged.answer[0].ttl);
         try testing.expectEqual(@as(u32, 27), aged.authority[0].ttl);
     }
+}
+
+test "forwarded TTLs are capped by max_ttl, then aged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const name = "\x03www\x07example\x03net\x00";
+    const q: wire.Question = .{ .name = name, .type = .a };
+    const f: Forward = .{ .id = 7, .rd = true, .question = q, .opt = null, .limit = 512, .max_ttl = 120 };
+    var up: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    const m: wire.Message = .{ .flags = .{ .qr = true, .rcode = 3 }, .question = &.{q}, .answer = &.{
+        .{ .name = name, .type = .a, .ttl = 300, .rdata = "1234" },
+        .{ .name = name, .type = .a, .ttl = 10, .rdata = "5678" },
+    }, .authority = &.{.{ .name = "\x00", .type = .soa, .ttl = 3600, .rdata = "\x00\x00" ++ "\x00" ** 18 ++ "\x0e\x10" }} };
+    const n = try m.encode(&up);
+    const reply = try wire.Message.parse(a, out[0..forwarded(a, f, up[0..n], 3, &out)]);
+    try testing.expectEqual(@as(u32, 117), reply.answer[0].ttl);
+    try testing.expectEqual(@as(u32, 7), reply.answer[1].ttl);
+    try testing.expectEqual(@as(u32, 117), reply.authority[0].ttl);
 }
 
 test "review A6: a forwarded truncated answer retains TC and cannot be cached" {

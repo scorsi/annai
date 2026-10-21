@@ -218,19 +218,7 @@ pub const Server = struct {
         const busy = for (s.pending) |p| {
             if (p != null) break true;
         } else false;
-        for (try s.poller.wait(&events, if (busy) @min(idle_ms, 100) else idle_ms)) |ev| {
-            if (ev.token >= s.slots.len) {
-                s.onUpstream(ev.token - s.slots.len);
-                continue;
-            }
-            switch (s.slots[ev.token]) {
-                .udp => |fd| s.serveUdp(fd),
-                .listener => |fd| s.accept(fd),
-                .conn => |*c| if (ev.fatal) s.close(ev.token) else s.serveTcp(ev.token, c),
-                .scrape => |fd| s.scrape(fd),
-                .free => {},
-            }
-        }
+        s.dispatch(try s.poller.wait(&events, if (busy) @min(idle_ms, 100) else idle_ms));
         const now = nowMs();
         s.overlay.expire(@divTrunc(now, 1000));
         for (s.slots, 0..) |slot, i| if (slot == .conn and slot.conn.deadline <= now) s.close(i);
@@ -240,6 +228,26 @@ pub const Server = struct {
             s.metrics.upstream(u, .timeout);
             s.attempt(i, p.*.?.upstream + 1);
         };
+    }
+
+    /// Handles one batch of ready events.
+    fn dispatch(s: *Server, events: []const poll.Event) void {
+        // A connection accepted while this batch is handled may reuse the slot of one closed
+        // earlier in it; the batch's remaining events for that slot are the old one's (review R1).
+        const born = s.next_gen;
+        for (events) |ev| {
+            if (ev.token >= s.slots.len) {
+                s.onUpstream(ev.token - s.slots.len);
+                continue;
+            }
+            switch (s.slots[ev.token]) {
+                .udp => |fd| s.serveUdp(fd),
+                .listener => |fd| s.accept(fd),
+                .conn => |*c| if (c.gen > born) {} else if (ev.fatal) s.close(ev.token) else s.serveTcp(ev.token, c),
+                .scrape => |fd| s.scrape(fd),
+                .free => {},
+            }
+        }
     }
 
     fn respond(s: *Server, packet: []const u8, to: ReplyTo, a: Asker) ?[]const u8 {
@@ -1330,6 +1338,26 @@ test "a reset while waiting releases the TCP slot within eight steps (review R1)
         for (0..8) |_| try s.step(0);
         try testing.expect(!try probeAvailable(replacement, &qbuf));
     }
+}
+
+test "a stale fatal event in the same batch spares the connection that reused the slot (recheck R1)" {
+    const l = try Loopback.init(testing.allocator, .{});
+    defer l.deinit();
+    const s = l.server;
+    const token = s.first_conn;
+    const first = try l.connect();
+    defer _ = sys.close(first);
+    for (0..8) |_| {
+        try s.step(10);
+        if (s.slots[token] == .conn) break;
+    }
+    const gen = s.slots[token].conn.gen;
+    const second = try l.connect(); // waits in the backlog until the listener event below
+    defer _ = sys.close(second);
+    // The reviewer's order: something closes the first connection, the listener accepts into its
+    // slot, then the batch still holds the first connection's ERR/HUP.
+    s.dispatch(&.{ .{ .token = token, .fatal = true }, .{ .token = 1, .fatal = false }, .{ .token = token, .fatal = true } });
+    try testing.expect(s.slots[token] == .conn and s.slots[token].conn.gen != gen);
 }
 
 test "six pipelined queries with 1.8 second upstream replies all complete (review R2)" {

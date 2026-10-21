@@ -86,9 +86,10 @@ pub const Message = struct {
         const ar = try r.int(u16);
         // A question is at least 5 bytes and an RR 11: refuse a lying header before allocating.
         if (@as(usize, qd) * 5 + (@as(usize, an) + ns + ar) * 11 > packet.len - r.pos) return error.Malformed;
-        // Amortize 64 hops per possible name (owner + at most two RDATA names per RR).
-        // This admits ordinary backward chains while bounding total work linearly (A1, B1).
-        r.hops = 64 * (@as(usize, qd) + 3 * (@as(usize, an) + ns + ar));
+        // Only 14-bit offsets can be pointer targets. Resolve each pointer-only suffix once.
+        var pointers: [0x4000]u16 = undefined;
+        r.pointers = pointers[0..@min(packet.len, pointers.len)];
+        @memset(r.pointers, 0xffff);
         const qs = try a.alloc(Question, qd);
         for (qs) |*q| q.* = .{ .name = try parseName(a, &r), .type = @enumFromInt(try r.int(u16)), .class = @enumFromInt(try r.int(u16)) };
         m.question = qs;
@@ -112,20 +113,27 @@ pub const Message = struct {
     }
 
     /// The OPT RR, if any. Two of them, or one not owned by the root, is a FORMERR (RFC 6891 §6.1.1).
-    pub fn edns(m: Message) error{Malformed}!?Opt {
+    pub fn optRecord(m: Message) error{Malformed}!?Opt {
         for (m.answer) |r| if (r.type == .opt) return error.Malformed;
         for (m.authority) |r| if (r.type == .opt) return error.Malformed;
         var found: ?Opt = null;
         for (m.additional) |r| if (r.type == .opt) {
             if (found != null or r.name.len != 1) return error.Malformed;
-            var options: Reader = .{ .buf = r.rdata };
+            found = Opt.fromRR(r);
+        };
+        return found;
+    }
+
+    pub fn edns(m: Message) error{Malformed}!?Opt {
+        const found = try m.optRecord();
+        if (found) |opt| {
+            var options: Reader = .{ .buf = opt.options };
             while (options.pos < options.buf.len) {
                 _ = try options.int(u16);
                 const len = try options.int(u16);
                 _ = try options.take(len);
             }
-            found = Opt.fromRR(r);
-        };
+        }
         return found;
     }
 };
@@ -211,6 +219,8 @@ pub const Reader = struct {
     pos: usize = 0,
     /// Compression pointers `name` may still follow, over every name read; out = Malformed.
     hops: usize = std.math.maxInt(usize),
+    /// First non-pointer offset for each decoded pointer; 0xffff means unresolved.
+    pointers: []u16 = &.{},
 
     pub fn take(r: *Reader, n: usize) error{Malformed}![]const u8 {
         if (r.buf.len - r.pos < n) return error.Malformed;
@@ -244,8 +254,8 @@ pub const Reader = struct {
         }
     }
 
-    /// Reads a possibly compressed name into `out`. Every pointer must point strictly before
-    /// itself, which rules out loops and forward references; the result stays within 255 bytes.
+    /// Reads a possibly compressed name into `out`. Pointers must point strictly backward;
+    /// memoized pointer chains and the 255-byte expanded-name limit bound total work linearly.
     fn name(r: *Reader, out: *[255]u8) error{Malformed}![]const u8 {
         var len: usize = 0;
         var pos = r.pos;
@@ -264,10 +274,7 @@ pub const Reader = struct {
                     if (c == 0) return out[0..len];
                 },
                 0xC0 => {
-                    if (pos + 2 > r.buf.len) return error.Malformed;
-                    const target = @as(usize, c & 0x3F) << 8 | r.buf[pos + 1];
-                    if (target >= pos or r.hops == 0) return error.Malformed;
-                    r.hops -= 1;
+                    const target = try r.pointer(pos);
                     if (!jumped) r.pos = pos + 2;
                     jumped = true;
                     pos = target;
@@ -275,6 +282,31 @@ pub const Reader = struct {
                 else => return error.Malformed, // 0x40 and 0x80 label types are deprecated or unassigned
             }
         }
+    }
+
+    fn pointer(r: *Reader, start: usize) error{Malformed}!usize {
+        var pos = start;
+        while (r.buf[pos] & 0xc0 == 0xc0) {
+            if (pos + 2 > r.buf.len) return error.Malformed;
+            if (pos < r.pointers.len and r.pointers[pos] != 0xffff) {
+                pos = r.pointers[pos];
+                break;
+            }
+            if (r.hops == 0) return error.Malformed;
+            const target = @as(usize, r.buf[pos] & 0x3f) << 8 | r.buf[pos + 1];
+            if (target >= pos) return error.Malformed;
+            r.hops -= 1;
+            pos = target;
+        }
+        // Compress the path without recursion or a chain-sized stack.
+        var at = start;
+        while (at != pos) {
+            if (at < r.pointers.len and r.pointers[at] != 0xffff) break;
+            const next = @as(usize, r.buf[at] & 0x3f) << 8 | r.buf[at + 1];
+            if (at < r.pointers.len) r.pointers[at] = @intCast(pos);
+            at = next;
+        }
+        return pos;
     }
 };
 
@@ -306,7 +338,7 @@ fn parseRRs(a: Allocator, r: *Reader, count: u16, last: *usize) ParseError![]con
 fn decompress(a: Allocator, outer: *Reader, raw_len: usize, fields: []const Field) ParseError![]const u8 {
     const out = try a.alloc(u8, raw_len + 2 * 255);
     var len: usize = 0;
-    var r: Reader = .{ .buf = outer.buf[0..outer.pos], .pos = outer.pos - raw_len, .hops = outer.hops };
+    var r: Reader = .{ .buf = outer.buf[0..outer.pos], .pos = outer.pos - raw_len, .hops = outer.hops, .pointers = outer.pointers };
     defer outer.hops = r.hops;
     for (fields) |f| switch (f) {
         .name => {
@@ -700,7 +732,7 @@ test "malformed corpus is rejected" {
             return error.TestUnexpectedResult;
         } else |e| try testing.expectEqual(error.Malformed, e);
     }
-    try testing.expectEqual(@as(usize, 25), count);
+    try testing.expectEqual(@as(usize, 24), count);
 }
 
 /// The review's A1 packet: `n` names after the root question, each a pointer to the previous
@@ -724,34 +756,57 @@ pub fn pointerChain(buf: []u8, n: usize, section: usize) []const u8 {
     return buf[0..len];
 }
 
-test "chained compression pointers run out of the per-packet budget (review A1)" {
+test "long pointer chains are decoded once per offset (review A1, B1)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const buf = try testing.allocator.alloc(u8, 65535);
-    defer testing.allocator.free(buf);
-    // The review's packet: 65,501 bytes, 10,915 questions, ~54 ms each before the budget.
-    const qs = pointerChain(buf, 10914, 4);
+    var buf: [65535]u8 = undefined;
+    for ([_]usize{ 40, 384, 4094 }) |count| {
+        const packet = pointerChain(&buf, count, 6);
+        if (count == 384) try testing.expectEqual(@as(usize, 6161), packet.len);
+        const m = try Message.parse(arena.allocator(), packet);
+        try testing.expectEqual(count, m.answer.len);
+        for (m.answer) |rr| {
+            try testing.expectEqualSlices(u8, "\x00", rr.name);
+            try testing.expectEqualSlices(u8, "\x7f\x00\x00\x01", rr.rdata);
+        }
+        // Decode the deepest chain first (as a pointer into opaque RDATA could), then reuse every suffix.
+        var pointers: [0x4000]u16 = @splat(0xffff);
+        var r: Reader = .{ .buf = packet, .pointers = &pointers, .hops = count };
+        var name: [255]u8 = undefined;
+        var i = count;
+        while (i > 0) {
+            i -= 1;
+            r.pos = 17 + 16 * i;
+            try testing.expectEqualSlices(u8, "\x00", try r.name(&name));
+        }
+        try testing.expectEqual(@as(usize, 0), r.hops); // exactly one expansion per pointer
+    }
+    // The original multi-question attack is wire-valid; engine.respond still rejects it before allocating.
+    const qs = pointerChain(&buf, 10914, 4);
     try testing.expectEqual(@as(usize, 65501), qs.len);
-    try testing.expectError(error.Malformed, Message.parse(arena.allocator(), qs));
-    // The same chain on the owners of the answer section: a question-count check does not stop it.
-    try testing.expectError(error.Malformed, Message.parse(arena.allocator(), pointerChain(buf, 4000, 6)));
-    // A short chain is ordinary compression and still parses.
-    const short = try Message.parse(arena.allocator(), pointerChain(buf, 20, 6));
-    try testing.expectEqual(@as(usize, 20), short.answer.len);
+    try testing.expectEqual(@as(usize, 10915), (try Message.parse(arena.allocator(), qs)).question.len);
 }
 
-test "40 chained A owners fit the compression budget (review B1)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var buf: [657]u8 = undefined;
-    const packet = pointerChain(&buf, 40, 6); // 820 hops, but only 657 bytes
-    try testing.expectEqual(@as(usize, 657), packet.len);
-    const m = try Message.parse(arena.allocator(), packet);
-    try testing.expectEqual(@as(usize, 40), m.answer.len);
-    for (m.answer) |rr| {
-        try testing.expectEqualSlices(u8, "\x00", rr.name);
-        try testing.expectEqualSlices(u8, "\x7f\x00\x00\x01", rr.rdata);
+test "memoized pointers still reject label cycles and overlong names (review B1)" {
+    var pointers: [512]u16 = @splat(0xffff);
+    var buf: [512]u8 = @splat(0);
+    @memcpy(buf[0..4], "\x01a\xc0\x00"); // backward pointer, but the label takes us back to it
+    var r: Reader = .{ .buf = &buf, .pointers = &pointers };
+    var name: [255]u8 = undefined;
+    try testing.expectError(error.Malformed, r.name(&name));
+    @memset(&pointers, 0xffff);
+    for (0..4) |i| {
+        buf[64 * i] = 63;
+        @memset(buf[64 * i + 1 ..][0..63], 'a');
     }
+    r.pos = 0;
+    try testing.expectError(error.Malformed, r.name(&name));
+    @memset(&pointers, 0xffff);
+    r = .{ .buf = "\x00\xc0\x00", .pos = 1, .pointers = &pointers };
+    _ = try r.name(&name);
+    r.buf = r.buf[0..2];
+    r.pos = 1;
+    try testing.expectError(error.Malformed, r.name(&name)); // a cached pointer cannot lend a missing byte
 }
 
 test "early OPT recovery validates boundaries, placement and options (review B2)" {

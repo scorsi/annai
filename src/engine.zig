@@ -74,7 +74,13 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
         error.Malformed => return r.finish(id, out, .formerr),
         error.OutOfMemory => return r.finish(id, out, .servfail),
     };
-    const opt = msg.edns() catch return r.finish(id, out, .formerr);
+    const q = msg.question[0];
+    r.question = q;
+    const opt = msg.edns() catch {
+        // A malformed option still requires a minimal response OPT (RFC 6891 §7).
+        if (msg.optRecord() catch null) |_| r.opt = .{ .payload = @min(out.len, max_udp_payload) };
+        return r.finish(id, out, .formerr);
+    };
     if (opt) |o| {
         r.opt = .{ .payload = @min(out.len, max_udp_payload) };
         if (transport == .udp) r.limit = std.math.clamp(o.payload, min_udp_payload, max_udp_payload);
@@ -83,8 +89,6 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
             return r.finish(id, out, .noerror);
         }
     }
-    const q = msg.question[0];
-    r.question = q;
     // A signed message is verified before it is acted upon; a failure is NOTAUTH with the TSIG
     // error in the response (unsigned for BADKEY and BADSIG, signed for BADTIME, RFC 8945 §5.2).
     r.tsig = tsig.verify(ctx.keys, query, msg, ctx.now) catch return r.finish(id, out, .formerr);
@@ -136,17 +140,17 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
         if (static) |name| if (name.get(q.type)) |set| for (set.rdatas) |rd| r.answer(.{ .name = owner, .type = set.type, .ttl = set.ttl, .rdata = rd });
         // ADR 0006: dynamic records come after the static ones, never instead of them.
         if (overlay != null and q.type == .txt) {
-            var dynamic_ttl: ?u32 = null;
             for (overlay.?.records.items) |rec| if (std.mem.eql(u8, rec.name, owner)) {
                 // Never cached past the local lifetime (review A12); `expire` left at least one second.
                 const ttl: u32 = @intCast(@min(rec.ttl, rec.expires - ctx.mono));
-                dynamic_ttl = @min(dynamic_ttl orelse ttl, ttl);
                 r.answer(.{ .name = owner, .type = .txt, .ttl = ttl, .rdata = rec.rdata });
             };
             // RFC 2181 §5.2: one TTL for the whole RRset, static members included (review A8).
-            if (dynamic_ttl) |ttl| for (r.answers.items[before..]) |*rr| {
-                rr.ttl = @min(rr.ttl, ttl);
-            };
+            var ttl: u32 = std.math.maxInt(u32);
+            for (r.answers.items[before..]) |rr| ttl = @min(ttl, rr.ttl);
+            for (r.answers.items[before..]) |*rr| {
+                rr.ttl = ttl;
+            }
         }
         if (r.answers.items.len > before) return r.finish(id, out, .noerror);
         // A name with dynamic records below it exists (ADR 0004): NODATA, not NXDOMAIN.
@@ -750,9 +754,25 @@ test "a question count other than one is FORMERR before anything is decoded (rev
     const m = try wire.Message.parse(f.arena.allocator(), f.out[0..n]);
     try testing.expectEqual(Rcode.formerr, @as(Rcode, @enumFromInt(m.flags.rcode)));
     try testing.expectEqual(@as(usize, 0), failing.allocations);
-    // One question but a chain on the answer owners: the parser's hop budget refuses it.
-    const owners = try f.reply(wire.pointerChain(&f.buf, 4000, 6), .tcp);
-    try testing.expectEqual(Rcode.formerr, @as(Rcode, @enumFromInt(owners.flags.rcode)));
+}
+
+test "malformed EDNS options return FORMERR with the question and a minimal OPT (review R3)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    for ([_][]const u8{ "\x00\x01\x00", "\x00\x01\x00\x02x" }) |options| {
+        for ([_]Transport{ .udp, .tcp }) |transport| {
+            const m = try f.ask(.{ .name = "HuB.Kekkai.UCHI.example.org.", .opt = .{ .payload = 4096, .options = options }, .transport = transport });
+            try expectRcode(m, .formerr);
+            try testing.expectEqual(@as(usize, 1), m.question.len);
+            try testing.expectEqualSlices(u8, "\x03HuB\x06Kekkai\x04UCHI\x07example\x03org\x00", m.question[0].name);
+            try testing.expectEqual(wire.Type.a, m.question[0].type);
+            try testing.expectEqual(@as(usize, 1), m.additional.len);
+            const opt = (try m.edns()).?;
+            try testing.expectEqual(@as(u16, max_udp_payload), opt.payload);
+            try testing.expectEqual(@as(usize, 0), opt.options.len);
+            try testing.expect(opt.version == 0 and opt.ext_rcode == 0 and !opt.do);
+        }
+    }
 }
 
 test "early question-count FORMERR echoes a valid OPT without allocation (review B2)" {
@@ -816,6 +836,26 @@ test "one TTL per TXT RRset, never beyond the overlay lifetime (review A8, A12)"
     const gone = try f.ask(.{ .name = "_acme-challenge.gone.example.org.", .type = .txt });
     try testing.expect(gone.answer.len == 1 and std.mem.eql(u8, gone.answer[0].rdata, "\x04wild"));
     try testing.expectEqual(@as(usize, 3), f.overlay.records.items.len);
+}
+
+test "static TXT TTL 30 caps a dynamic member with TTL 120 (review A8)" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    var d: config.Diag = .{};
+    const text = try std.mem.replaceOwned(u8, f.arena.allocator(), apex_zone, "ttl = 300", "ttl = 30");
+    f.zones[1] = try config.loadZone(f.arena.allocator(), text, &d);
+    f.soto(0);
+    const gpa = f.overlay.gpa;
+    try f.overlay.records.append(gpa, .{
+        .name = try gpa.dupe(u8, "\x0f_acme-challenge\x06static\x07example\x03org\x00"),
+        .rdata = try gpa.dupe(u8, "\x07dynamic"),
+        .ttl = 120,
+        .expires = 5000,
+    });
+    const m = try f.ask(.{ .name = "_acme-challenge.static.example.org.", .type = .txt });
+    try expectRcode(m, .noerror);
+    try testing.expectEqual(@as(usize, 2), m.answer.len);
+    for (m.answer) |rr| try testing.expectEqual(@as(u32, 30), rr.ttl);
 }
 
 test "an UPDATE signed with a truncated MAC is applied and answered signed (review A7)" {

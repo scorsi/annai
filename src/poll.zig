@@ -6,7 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
-pub const Event = struct { token: usize };
+pub const Event = struct { token: usize, fatal: bool };
 pub const Interest = enum { read, write, none };
 
 pub const Poller = switch (builtin.os.tag) {
@@ -65,7 +65,7 @@ const Epoll = struct {
             const rc = linux.epoll_wait(p.fd, &raw, max, timeout_ms);
             if (posix.errno(rc) == .INTR) continue;
             try check(rc);
-            for (raw[0..rc], events[0..rc]) |r, *e| e.* = .{ .token = r.data.ptr };
+            for (raw[0..rc], events[0..rc]) |r, *e| e.* = .{ .token = r.data.ptr, .fatal = r.events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0 };
             return events[0..rc];
         }
     }
@@ -98,8 +98,15 @@ const Kqueue = struct {
     pub fn set(p: *Kqueue, fd: posix.fd_t, token: usize, interest: Interest) Error!void {
         const on = c.EV.ADD | c.EV.ENABLE;
         const off = c.EV.ADD | c.EV.DISABLE;
+        // Keep reset notifications while reads pause; EV_CLEAR avoids spinning on buffered data or a half-close.
         var changes = [_]c.Kevent{
-            .{ .ident = @intCast(fd), .filter = c.EVFILT.READ, .flags = if (interest == .read) on else off, .fflags = 0, .data = 0, .udata = token },
+            // EV_ADD alone does not replace EV_CLEAR on an existing macOS filter.
+            .{ .ident = @intCast(fd), .filter = c.EVFILT.READ, .flags = c.EV.DELETE, .fflags = 0, .data = 0, .udata = token },
+            .{ .ident = @intCast(fd), .filter = c.EVFILT.READ, .flags = switch (interest) {
+                .read => on,
+                .write => off,
+                .none => on | c.EV.CLEAR,
+            }, .fflags = 0, .data = 0, .udata = token },
             .{ .ident = @intCast(fd), .filter = c.EVFILT.WRITE, .flags = if (interest == .write) on else off, .fflags = 0, .data = 0, .udata = token },
         };
         try check(c.kevent(p.fd, &changes, changes.len, &changes, 0, null));
@@ -114,7 +121,11 @@ const Kqueue = struct {
             if (posix.errno(rc) == .INTR) continue;
             try check(rc);
             const n: usize = @intCast(rc);
-            for (raw[0..n], events[0..n]) |r, *e| e.* = .{ .token = r.udata };
+            for (raw[0..n], events[0..n]) |r, *e| e.* = .{
+                .token = r.udata,
+                // Read EOF without an error is a half-close: the client can still receive replies.
+                .fatal = r.flags & c.EV.ERROR != 0 or (r.flags & c.EV.EOF != 0 and (r.fflags != 0 or r.filter == c.EVFILT.WRITE)),
+            };
             return events[0..n];
         }
     }

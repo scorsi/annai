@@ -226,7 +226,7 @@ pub const Server = struct {
             switch (s.slots[ev.token]) {
                 .udp => |fd| s.serveUdp(fd),
                 .listener => |fd| s.accept(fd),
-                .conn => |*c| s.serveTcp(ev.token, c),
+                .conn => |*c| if (ev.fatal) s.close(ev.token) else s.serveTcp(ev.token, c),
                 .scrape => |fd| s.scrape(fd),
                 .free => {},
             }
@@ -512,6 +512,7 @@ pub const Server = struct {
             const end = frameEnd(c.buf[0..c.len]) orelse return;
             c.messages += 1;
             if (c.messages > max_messages_per_conn) return s.close(token);
+            c.deadline = nowMs() + idle_timeout_ms;
             if (s.respond(c.buf[2..end], .{ .tcp = .{ .token = token, .gen = c.gen } }, .{ .proto = .tcp, .client = c.peer, .start = nowNs() })) |reply| s.send(token, reply);
             // The answer, or a SERVFAIL delivered while forwarding, may have closed this connection.
             if (s.slots[token] != .conn) return;
@@ -529,8 +530,11 @@ pub const Server = struct {
         var data: []const u8 = s.out[0 .. 2 + reply.len];
         if (c.pending.items.len == 0) {
             data = data[sendSome(c.fd, data) orelse return s.close(token) ..];
-            if (data.len == 0) return;
-            c.deadline = @min(c.deadline, nowMs() + write_timeout_ms);
+            if (data.len == 0) {
+                c.deadline = nowMs() + idle_timeout_ms;
+                return;
+            }
+            c.deadline = nowMs() + write_timeout_ms;
             s.poller.set(c.fd, token, .write) catch return s.close(token);
         }
         if (c.pending.items.len + data.len > max_pending_output) return s.close(token);
@@ -599,6 +603,21 @@ pub const Server = struct {
 
     fn close(s: *Server, token: usize) void {
         const c = &s.slots[token].conn;
+        // Drop only this generation's waiters; coalesced queries still belong to their other clients.
+        for (&s.pending) |*slot| if (slot.*) |*p| {
+            var i: usize = 0;
+            while (i < p.waiters.items.len) {
+                const to = p.waiters.items[i].to;
+                if (to == .tcp and to.tcp.token == token and to.tcp.gen == c.gen) {
+                    _ = p.waiters.swapRemove(i);
+                } else i += 1;
+            }
+            if (p.waiters.items.len == 0) {
+                s.closeUpstream(p);
+                p.waiters.deinit(s.gpa);
+                slot.* = null;
+            }
+        };
         s.poller.remove(c.fd);
         _ = sys.close(c.fd);
         c.pending.deinit(s.gpa);
@@ -1216,6 +1235,8 @@ test "a TCP client's EOF does not drop the forwarded answer it is owed (review A
     } else return error.NoUpstreamQuery;
     for (0..50) |_| try l.server.step(0); // the EOF is read while the upstream is silent
     try testing.expectEqual(@as(usize, 1), l.conns());
+    var events: [64]poll.Event = undefined;
+    try testing.expectEqual(@as(usize, 0), (try l.server.poller.wait(&events, 0)).len);
     // The upstream answers: the client still gets it, then the connection closes.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1234,6 +1255,127 @@ test "a TCP client's EOF does not drop the forwarded answer it is owed (review A
     const m = try wire.Message.parse(arena.allocator(), got.items[2..end]);
     try testing.expect(m.id == 0x4242 and m.flags.qr and m.answer.len == 1);
     try testing.expect(!try readSome(l, fd, &got, end + 1)); // then EOF
+    try testing.expectEqual(@as(usize, 0), l.conns());
+}
+
+test "a reset while waiting releases the TCP slot within eight steps (review R1)" {
+    for ([_]bool{ false, true }) |coalesced| {
+        var probe = try ForwardProbe.init(testing.allocator);
+        defer probe.deinit();
+        const l = probe.l;
+        const s = l.server;
+        var fd = try l.connect();
+        defer if (fd >= 0) {
+            _ = sys.close(fd);
+        };
+        var qbuf: [512]u8 = undefined;
+        try probeSend(fd, queryFrame(&qbuf, 1, "www.example.net.", .a), null, 0);
+        var packet: [512]u8 = undefined;
+        var peer: PosixAddress = undefined;
+        var peer_len: posix.socklen_t = @sizeOf(PosixAddress);
+        const len = try probe.receive(probe.udp, &packet, &peer, &peer_len);
+        const token = s.first_conn;
+        try testing.expect(s.slots[token].conn.waiting);
+        const gen = s.slots[token].conn.gen;
+        const survivor = if (coalesced) try l.connect() else -1;
+        defer if (survivor >= 0) {
+            _ = sys.close(survivor);
+        };
+        if (coalesced) {
+            try probeSend(survivor, queryFrame(&qbuf, 2, "www.example.net.", .a), null, 0);
+            for (0..8) |_| {
+                try s.step(10);
+                if (s.pending[0].?.waiters.items.len == 2) break;
+            }
+            try testing.expectEqual(@as(usize, 2), s.pending[0].?.waiters.items.len);
+        }
+        const reset = std.mem.toBytes(posix.linger{ .onoff = 1, .linger = 0 });
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.LINGER, &reset);
+        _ = sys.close(fd);
+        fd = -1;
+        for (0..8) |_| {
+            try s.step(10);
+            if (s.slots[token] == .free) break;
+        }
+        try testing.expect(s.slots[token] == .free);
+        try testing.expect(!s.awaited(token, gen));
+        try testing.expectEqual(@as(usize, @intFromBool(coalesced)), l.conns());
+        if (coalesced) {
+            try testing.expectEqual(@as(usize, 1), s.pending[0].?.waiters.items.len);
+        } else {
+            for (s.pending) |pending| try testing.expect(pending == null);
+        }
+        var events: [64]poll.Event = undefined;
+        try testing.expectEqual(@as(usize, 0), (try s.poller.wait(&events, 0)).len);
+
+        // Reuse the connection slot before a late answer: it must not reach the new generation.
+        const replacement = try l.connect();
+        defer _ = sys.close(replacement);
+        for (0..8) |_| {
+            try s.step(10);
+            if (s.slots[token] == .conn) break;
+        }
+        try testing.expect(s.slots[token] == .conn and s.slots[token].conn.gen != gen);
+        packet[2] |= 0x80;
+        try probeSend(probe.udp, packet[0..len], &peer, peer_len);
+        if (coalesced) {
+            var got: std.ArrayList(u8) = .empty;
+            defer got.deinit(testing.allocator);
+            try testing.expect(try readSome(l, survivor, &got, 4));
+            try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, got.items[2..4], .big));
+        }
+        for (0..8) |_| try s.step(0);
+        try testing.expect(!try probeAvailable(replacement, &qbuf));
+    }
+}
+
+test "six pipelined queries with 1.8 second upstream replies all complete (review R2)" {
+    var probe = try ForwardProbe.init(testing.allocator);
+    defer probe.deinit();
+    const l = probe.l;
+    const fd = try l.connect();
+    defer _ = sys.close(fd);
+    var stream: [1024]u8 = undefined;
+    var size: usize = 0;
+    for (0..6) |id| {
+        var name: [32]u8 = undefined;
+        size += queryFrame(stream[size..], @intCast(id), try std.fmt.bufPrint(&name, "q{d}.example.net.", .{id}), .a).len;
+    }
+    try probeSend(fd, stream[0..size], null, 0);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var total: usize = 0;
+    for (0..6) |id| {
+        var packet: [512]u8 = undefined;
+        var peer: PosixAddress = undefined;
+        var peer_len: posix.socklen_t = @sizeOf(PosixAddress);
+        const len = try probe.receive(probe.udp, &packet, &peer, &peer_len);
+        const asked = try wire.Message.parse(arena.allocator(), packet[0..len]);
+        const until = nowMs() + 1800;
+        while (nowMs() < until) try l.server.step(10);
+        try testing.expectEqual(@as(usize, 1), l.conns());
+        const response: wire.Message = .{
+            .id = asked.id,
+            .flags = .{ .qr = true },
+            .question = asked.question,
+            .answer = &.{.{ .name = asked.question[0].name, .type = .a, .ttl = 60, .rdata = "\xc0\x00\x02\x01" }},
+        };
+        var reply: [512]u8 = undefined;
+        const n = try response.encode(&reply);
+        try probeSend(probe.udp, reply[0..n], &peer, peer_len);
+        try testing.expect(try readSome(l, fd, &got, total + 2));
+        const end = total + 2 + @as(usize, std.mem.readInt(u16, got.items[total..][0..2], .big));
+        try testing.expect(try readSome(l, fd, &got, end));
+        const answer = try wire.Message.parse(arena.allocator(), got.items[total + 2 .. end]);
+        try testing.expectEqual(@as(u16, @intCast(id)), answer.id);
+        try testing.expect(answer.flags.rcode == 0 and answer.answer.len == 1);
+        try testing.expectEqualSlices(u8, asked.question[0].name, answer.question[0].name);
+        total = end;
+    }
+    _ = sys.shutdown(fd, posix.SHUT.WR);
+    try testing.expect(!try readSome(l, fd, &got, total + 1));
     try testing.expectEqual(@as(usize, 0), l.conns());
 }
 

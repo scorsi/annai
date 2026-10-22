@@ -9,11 +9,11 @@
     };
     # Test only (ADR 0011): the log and metric validators the nixosTests run on annai's output.
     nisshi = {
-      url = "git+ssh://git@ishizue.tail9883f3.ts.net:2222/scorsi/nisshi.git";
+      url = "git+ssh://git@forgejo.uchi.scorsi.dev:2222/scorsi/nisshi.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     masu = {
-      url = "git+ssh://git@ishizue.tail9883f3.ts.net:2222/scorsi/masu.git";
+      url = "git+ssh://git@forgejo.uchi.scorsi.dev:2222/scorsi/masu.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

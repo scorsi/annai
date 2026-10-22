@@ -214,7 +214,7 @@ pub const Fixture = struct {
         f.loopback = l;
         // shortcut: one connection per 3 ms stays under the ephemeral ports that TIME_WAIT holds
         // (about 16k for 30 s on macOS, 28k for 60 s on Linux); a faster loop runs out and fails to connect.
-        _ = std.posix.poll(&.{}, 3) catch {};
+        _ = std.posix.system.nanosleep(&.{ .sec = 0, .nsec = 3 * std.time.ns_per_ms }, null);
         const n = @min(packet.len, max_packet);
         std.mem.writeInt(u16, f.stream[0..2], @intCast(n), .big);
         @memcpy(f.stream[2..][0..n], packet[0..n]);

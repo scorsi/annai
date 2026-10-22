@@ -1613,7 +1613,7 @@ pub const ForwardProbe = struct {
         var worker: ?std.Thread = null;
         if (retry) {
             // shortcut: pace TCP retries below TIME_WAIT port exhaustion, like the tcp target.
-            _ = posix.poll(&.{}, 3) catch {};
+            _ = posix.system.nanosleep(&.{ .sec = 0, .nsec = 3 * std.time.ns_per_ms }, null);
             // Short TCP frames must fail rather than accepting the parseable UDP packet.
             std.mem.writeInt(u16, tcp_reply[0..2], @intCast(packet.len), .big);
             @memcpy(tcp_reply[2..][0..packet.len], packet);

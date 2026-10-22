@@ -1,4 +1,4 @@
-# Unit tests, annai check on the example configs, module checks and the nixosTests on every push, on the Linux runner.
+# Unit tests, annai check on the example configs, module checks and the nixosTests on every push, on the Linux runner (one nix build per check, not nix flake check).
 on:
   push:
   workflow_dispatch:
@@ -8,4 +8,11 @@ jobs:
     runs-on: linux
     steps:
       - uses: https://code.forgejo.org/actions/checkout@v4
-      - run: nix flake check --print-build-logs
+      # One nix process per check: evaluating every nixosTest in one process
+      # (nix flake check) peaks around 6-9 GB; one check at a time stays near 2 GB.
+      - run: |
+          failed=
+          for c in $(nix eval --raw .#checks.aarch64-linux --apply 'c: builtins.concatStringsSep " " (builtins.attrNames c)'); do
+            nix build -L --no-link ".#checks.aarch64-linux.$c" || failed="$failed $c"
+          done
+          if [ -n "$failed" ]; then echo "failed checks:$failed"; exit 1; fi

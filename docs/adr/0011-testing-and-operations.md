@@ -1,6 +1,6 @@
 # ADR-0011: Testing and operations
 
-- Status: accepted, amended 2026-10-20 (logs and metrics, below)
+- Status: accepted, amended 2026-10-20 (logs and metrics, below), amended 2026-10-22 (CI builds each check separately, below)
 - Date: 2026-10-14
 
 ## Context
@@ -15,7 +15,7 @@ annai will face the Internet in `soto` mode. Nothing important runs on the homel
 - **Malformed-packet corpus** replayed in unit tests; **fuzzing** of the parser (zig's fuzzer or a minimal harness) is a hard prerequisite to public exposure (M4).
 - **nixosTest** as the integration harness, using standard tools as the oracle, never annai testing itself: `dig` (A/AAAA/CNAME/TXT/SRV, `+tcp`, `+norecurse`, EDNS payload sizes, NXDOMAIN/NODATA/empty non-terminal), `nsupdate` with TSIG for UPDATE (v1). Topology: one `soto` VM, one `uchi` VM forwarding to the `soto` VM as its "upstream", one client VM.
 - **A breakage seen on the real hosts becomes a nixosTest case before it is fixed.** That is how real-network incidents pay for themselves.
-- CI on the Forgejo runner: `nix flake check` runs unit tests, `annai check` on the example configs, and the nixosTest.
+- CI on the Forgejo runner: one `nix build -L` per check (amended 2026-10-22) runs unit tests, `annai check` on the example configs, and the nixosTest, because `nix flake check` evaluates every nixosTest in one process (6-9 GB) and is OOM-killed at the runner's cap. `nix flake check` stays the dev command.
 
 ### Operations
 

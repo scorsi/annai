@@ -11,8 +11,10 @@ jobs:
       # One nix process per check: evaluating every nixosTest in one process
       # (nix flake check) peaks around 6-9 GB; one check at a time stays near 2 GB.
       - run: |
+          checks=$(nix eval --raw .#checks.aarch64-linux --apply 'c: builtins.concatStringsSep " " (builtins.attrNames c)') || exit 1
+          [ -n "$checks" ] || { echo "no checks to build"; exit 1; }
           failed=
-          for c in $(nix eval --raw .#checks.aarch64-linux --apply 'c: builtins.concatStringsSep " " (builtins.attrNames c)'); do
+          for c in $checks; do
             nix build -L --no-link ".#checks.aarch64-linux.$c" || failed="$failed $c"
           done
           if [ -n "$failed" ]; then echo "failed checks:$failed"; exit 1; fi

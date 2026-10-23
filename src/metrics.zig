@@ -19,6 +19,10 @@ const bounds_ns = [_]u64{ 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000, 50
 
 pub const Upstream = enum { ok, timeout, @"error", rcode };
 pub const Update = enum { ok, refused, notauth, @"error" };
+/// Why annai ended a TCP connection the client had not finished with (normal ends are not counted).
+pub const TcpClose = enum { @"connection-cap", @"idle-timeout", @"write-timeout", @"message-cap", @"output-full", @"truncated-frame", @"error" };
+/// A message that gets no answer at all: shorter than a header, or itself a response.
+pub const Drop = enum { short, response };
 
 pub const Metrics = struct {
     /// [proto][qtype, `other` last][rcode, BADVERS then `other` last]
@@ -31,6 +35,9 @@ pub const Metrics = struct {
     upstreams: [][4]u64 = &.{},
     /// One row per configured key, then `none`: unsigned, or a TSIG failure.
     updates: [][4]u64 = &.{},
+    tcp_closes: [std.enums.values(TcpClose).len]u64 = @splat(0),
+    /// [proto][reason]
+    dropped: [2][std.enums.values(Drop).len]u64 = @splat(@splat(0)),
 
     pub fn init(gpa: std.mem.Allocator, n_upstreams: usize, n_keys: usize) !Metrics {
         const m: Metrics = .{ .upstreams = try gpa.alloc([4]u64, n_upstreams), .updates = try gpa.alloc([4]u64, n_keys + 1) };
@@ -60,6 +67,14 @@ pub const Metrics = struct {
 
     pub fn cacheLookup(m: *Metrics, hit: bool) void {
         m.cache[if (hit) 0 else 1] +|= 1;
+    }
+
+    pub fn tcpClose(m: *Metrics, reason: TcpClose) void {
+        m.tcp_closes[@intFromEnum(reason)] +|= 1;
+    }
+
+    pub fn drop(m: *Metrics, proto: Proto, reason: Drop) void {
+        m.dropped[@intFromEnum(proto)][@intFromEnum(reason)] +|= 1;
     }
 
     pub fn upstream(m: *Metrics, i: usize, result: Upstream) void {
@@ -127,6 +142,14 @@ pub fn write(m: *const Metrics, info: Info, w: *Writer) Writer.Error!void {
         try w.print("annai_query_duration_seconds_count{{proto=\"{s}\"}} {d}\n", .{ proto, total });
     }
 
+    try head(w, "annai_dropped_messages_total", "counter", "Messages left unanswered, by transport and reason (shorter than a header, or a response).");
+    for (m.dropped, 0..) |counts, p| for (counts, 0..) |n, r| {
+        try w.print("annai_dropped_messages_total{{proto=\"{s}\",reason=\"{s}\"}} {d}\n", .{ @tagName(@as(Proto, @enumFromInt(p))), @tagName(@as(Drop, @enumFromInt(r))), n });
+    };
+
+    try head(w, "annai_tcp_closes_total", "counter", "TCP connections annai refused or ended before the client was done, by reason.");
+    for (m.tcp_closes, 0..) |n, r| try w.print("annai_tcp_closes_total{{reason=\"{s}\"}} {d}\n", .{ @tagName(@as(TcpClose, @enumFromInt(r))), n });
+
     try head(w, "annai_cache_entries", "gauge", "Answers in the forwarding cache.");
     try w.print("annai_cache_entries {d}\n", .{info.cache_entries});
     try head(w, "annai_cache_lookups_total", "counter", "Forwarded queries looked up in the cache, by result.");
@@ -178,9 +201,12 @@ test "exposition: closed label sets, cumulative buckets, escaped values" {
     defer m.deinit(testing.allocator);
     m.query(.udp, .a, 0, 50_000); // 50 µs
     m.query(.udp, .a, 0, 3_000_000_000); // 3 s
-    m.query(.tcp, @enumFromInt(65), 16, 1);
+    m.query(.tcp, @enumFromInt(65280), 16, 1);
+    m.query(.tcp, @enumFromInt(64), 0, 1); // _dns.resolver.arpa. SVCB (RFC 9462), once TYPE64
     m.query(.udp, null, 1, 1);
     m.cacheLookup(true);
+    m.drop(.udp, .short);
+    m.tcpClose(.@"idle-timeout");
     m.upstream(0, .timeout);
     const keys = [_]tsig.Key{.{ .name = "\x05hanko\x00", .secret = "x" }};
     m.update(&keys, "\x05hanko\x00", .refused);
@@ -193,6 +219,7 @@ test "exposition: closed label sets, cumulative buckets, escaped values" {
         "annai_build_info{version=\"0.0.0\",mode=\"uc\\\"hi\"} 1\n",
         "annai_queries_total{proto=\"udp\",qtype=\"A\",rcode=\"NOERROR\"} 2\n",
         "annai_queries_total{proto=\"udp\",qtype=\"other\",rcode=\"FORMERR\"} 1\n",
+        "annai_queries_total{proto=\"tcp\",qtype=\"SVCB\",rcode=\"NOERROR\"} 1\n",
         "annai_queries_total{proto=\"tcp\",qtype=\"other\",rcode=\"BADVERS\"} 1\n",
         "annai_query_duration_seconds_bucket{proto=\"udp\",le=\"0.0001\"} 2\n",
         "annai_query_duration_seconds_bucket{proto=\"udp\",le=\"2.5\"} 2\n",
@@ -200,6 +227,10 @@ test "exposition: closed label sets, cumulative buckets, escaped values" {
         "annai_query_duration_seconds_bucket{proto=\"udp\",le=\"+Inf\"} 3\n",
         "annai_query_duration_seconds_sum{proto=\"udp\"} 3.000050001\n",
         "annai_query_duration_seconds_count{proto=\"udp\"} 3\n",
+        "annai_dropped_messages_total{proto=\"udp\",reason=\"short\"} 1\n",
+        "annai_dropped_messages_total{proto=\"tcp\",reason=\"response\"} 0\n",
+        "annai_tcp_closes_total{reason=\"idle-timeout\"} 1\n",
+        "annai_tcp_closes_total{reason=\"connection-cap\"} 0\n",
         "annai_cache_entries 3\n",
         "annai_cache_lookups_total{result=\"hit\"} 1\n",
         "annai_upstream_queries_total{upstream=\"9.9.9.9:53\",result=\"timeout\"} 1\n",
@@ -212,7 +243,7 @@ test "exposition: closed label sets, cumulative buckets, escaped values" {
     };
     try testing.expect(std.mem.endsWith(u8, text, "\n"));
     // One HELP and one TYPE per family.
-    try testing.expectEqual(@as(usize, 8), std.mem.count(u8, text, "# TYPE "));
+    try testing.expectEqual(@as(usize, 10), std.mem.count(u8, text, "# TYPE "));
 }
 
 test "the summed duration saturates instead of trapping (review A15)" {

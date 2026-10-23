@@ -111,10 +111,7 @@ pub fn respond(arena: std.mem.Allocator, ctx: Context, query: []const u8, out: [
     if (qflags.opcode == 4) return r.finish(id, out, .refused); // NOTIFY
     if (qflags.opcode != 0) return r.finish(id, out, .notimp);
     if (q.class != .in) return r.finish(id, out, .refused);
-    switch (@intFromEnum(q.type)) {
-        251, 252 => return r.finish(id, out, .refused), // IXFR, AXFR
-        else => {},
-    }
+    if (q.type == .ixfr or q.type == .axfr) return r.finish(id, out, .refused);
 
     var lowered: [255]u8 = undefined;
     @memcpy(lowered[0..q.name.len], q.name);

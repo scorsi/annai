@@ -148,10 +148,19 @@ test "a query line: schema order, escaped client strings, optional fields left o
         \\{"v":1,"ts":"2026-10-19T08:34:03.512004117Z","level":"info","event":"query","proto":"udp","client":"203.0.113.9","qname":"a\"b\\c\n.example.org.","qtype":"SOA","rcode":"NOERROR","aa":true,"cache":"none","size":112,"dur_us":38}
         ++ "\n", w.buffered());
     w = .fixed(&buf);
-    try writeLine(&w, 0, .warn, "upstream-error", .{ .upstream = "192.0.2.1:53", .qname = @as(?[]const u8, null), .qtype = typeName(@enumFromInt(65)), .rcode = rcodeName(16), .other = rcodeName(12), .err = "CONNREFUSED" });
+    try writeLine(&w, 0, .warn, "upstream-error", .{ .upstream = "192.0.2.1:53", .qname = @as(?[]const u8, null), .qtype = typeName(@enumFromInt(65280)), .rcode = rcodeName(16), .other = rcodeName(12), .err = "CONNREFUSED" });
     try testing.expectEqualStrings(
-        \\{"v":1,"ts":"1970-01-01T00:00:00.000000000Z","level":"warn","event":"upstream-error","upstream":"192.0.2.1:53","qtype":"TYPE65","rcode":"BADVERS","other":"RCODE12","err":"CONNREFUSED"}
+        \\{"v":1,"ts":"1970-01-01T00:00:00.000000000Z","level":"warn","event":"upstream-error","upstream":"192.0.2.1:53","qtype":"TYPE65280","rcode":"BADVERS","other":"RCODE12","err":"CONNREFUSED"}
         ++ "\n", w.buffered());
+}
+
+test "type names: registered mnemonics, else TYPE<n> (RFC 3597)" {
+    var buf: [32]u8 = undefined;
+    for ([_]struct { u16, []const u8 }{
+        .{ 1, "A" },             .{ 64, "SVCB" },  .{ 65, "HTTPS" },  .{ 43, "DS" },   .{ 51, "NSEC3PARAM" },
+        .{ 252, "AXFR" },        .{ 251, "IXFR" }, .{ 255, "ANY" },   .{ 256, "URI" }, .{ 257, "CAA" },
+        .{ 65280, "TYPE65280" }, .{ 0, "TYPE0" },  .{ 99, "TYPE99" },
+    }) |c| try testing.expectEqualStrings(c[1], try std.fmt.bufPrint(&buf, "{f}", .{typeName(@enumFromInt(c[0]))}));
 }
 
 test "question: lowercase, bounded, null when malformed" {

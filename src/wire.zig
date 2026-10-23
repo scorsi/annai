@@ -15,7 +15,10 @@ const Allocator = std.mem.Allocator;
 pub const ParseError = error{Malformed} || Allocator.Error;
 pub const WriteError = error{ NoSpace, Malformed };
 
-pub const Type = enum(u16) { a = 1, ns = 2, cname = 5, soa = 6, ptr = 12, hinfo = 13, mx = 15, txt = 16, aaaa = 28, srv = 33, opt = 41, tsig = 250, any = 255, caa = 257, _ };
+/// The types annai serves, plus the registered ones worth a name in logs and metric labels
+/// (DNSSEC, SVCB/HTTPS, transfers…). A tag here is only a name: the zone parser accepts its own
+/// list (config.record_types), and the label set stays closed (metrics.zig).
+pub const Type = enum(u16) { a = 1, ns = 2, cname = 5, soa = 6, ptr = 12, hinfo = 13, mx = 15, txt = 16, aaaa = 28, srv = 33, naptr = 35, dname = 39, opt = 41, ds = 43, sshfp = 44, rrsig = 46, nsec = 47, dnskey = 48, nsec3 = 50, nsec3param = 51, tlsa = 52, cds = 59, cdnskey = 60, svcb = 64, https = 65, tsig = 250, ixfr = 251, axfr = 252, any = 255, uri = 256, caa = 257, _ };
 pub const Class = enum(u16) { in = 1, none = 254, any = 255, _ };
 /// Header RCODEs (RFC 1035, 2136, 8945); upstreams may send any value.
 pub const Rcode = enum(u4) { noerror = 0, formerr = 1, servfail = 2, nxdomain = 3, notimp = 4, refused = 5, yxdomain = 6, yxrrset = 7, nxrrset = 8, notauth = 9, notzone = 10, _ };

@@ -1,6 +1,6 @@
 # ADR-0011: Testing and operations
 
-- Status: accepted, amended 2026-10-20 (logs and metrics, below), amended 2026-10-22 (CI builds each check separately, below)
+- Status: accepted, amended 2026-10-20 (logs and metrics, below), amended 2026-10-22 (CI builds each check separately, below), amended 2026-10-24 (named query types, drop and TCP close counters, in the metrics section)
 - Date: 2026-10-14
 
 ## Context
@@ -80,16 +80,32 @@ key=value logs" of v0 and the metrics bullet of v1; the rest of the decision sta
   stalls blocks the loop for at most one second (the same bound as `sendAll`); acceptable for a
   loopback-only client, revisited if scrapes ever show in `annai_query_duration_seconds`.
 - Families: `annai_build_info{version,mode}`, `annai_queries_total{proto,qtype,rcode}`
-  (`qtype` = the types annai knows, else `other`; `rcode` = the named rcodes, `BADVERS`, else
+  (`qtype` = the tags of `wire.Type`, else `other`; `rcode` = the named rcodes, `BADVERS`, else
   `other`), `annai_query_duration_seconds{proto}` (buckets fixed in the code, 0.1 ms to 10 s),
+  `annai_dropped_messages_total{proto,reason=short|response}` (a message that gets no answer and
+  no `query` line: shorter than a header, or a response; FORMERR answers are in
+  `annai_queries_total`), `annai_tcp_closes_total{reason}` (connections annai refused or ended
+  before the client was done: `connection-cap` at accept, `idle-timeout`, `write-timeout` (a
+  reader too slow for its pending answers), `message-cap` (the 101st message), `output-full`
+  (pending answers over 2 × 64 KiB), `truncated-frame` (the client hung up in the middle of a
+  frame, which is dropped), `error` (a reset, a socket or poller error); a client closing after
+  its answers is not counted; every series is written from the start),
   `annai_cache_entries`, `annai_cache_lookups_total{result=hit|miss}`,
   `annai_upstream_queries_total{upstream,result=ok|timeout|error|rcode}` (`upstream` = the
   configured address; `rcode` = it answered SERVFAIL, REFUSED, NOTIMP or FORMERR),
   `annai_updates_total{key,result=ok|refused|notauth|error}` (`key` = a configured key name, or
   `none` when unsigned or when TSIG verification failed, since the key name is then not
-  trusted), `annai_dynamic_records`. No client, name or error text in any label; at most
-  2 × 15 × 13 query series, 30 histogram series and 4 per upstream and per key, under masu's
-  500-series budget for any realistic configuration.
+  trusted), `annai_dynamic_records`. No client, name or error text in any label.
+- `wire.Type` names, besides the types annai serves, the registered ones seen in real traffic
+  or worth telling apart (amended 2026-10-24, after `_dns.resolver.arpa.` SVCB queries logged
+  as `TYPE64`): NAPTR, DNAME, DS, SSHFP, RRSIG, NSEC, DNSKEY, NSEC3, NSEC3PARAM, TLSA, CDS,
+  CDNSKEY, SVCB, HTTPS, IXFR, AXFR, URI. The `query` log line writes the same mnemonics. A tag
+  is only a name: the zone parser accepts its own list (`record_types`, ADR 0003), which a unit
+  test keeps apart from the enum. Series: 2 × 32 × 13 query series at most, 30 histogram series,
+  4 dropped and 7 TCP close series, 4 per upstream and per key. A query series exists only once
+  that (proto, qtype, rcode) was answered; realistic traffic stays well under masu's 500-series
+  budget, but a client that tries every named type with every error over both transports could
+  reach about 900, above the budget and under hikyaku's default `max_series` of 2000.
 - Counters live in the `Server` and only go up from process start (SIGHUP reload, M5, must
   keep them).
 

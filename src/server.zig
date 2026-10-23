@@ -221,7 +221,7 @@ pub const Server = struct {
         s.dispatch(try s.poller.wait(&events, if (busy) @min(idle_ms, 100) else idle_ms));
         const now = nowMs();
         s.overlay.expire(@divTrunc(now, 1000));
-        for (s.slots, 0..) |slot, i| if (slot == .conn and slot.conn.deadline <= now) s.close(i);
+        for (s.slots, 0..) |slot, i| if (slot == .conn and slot.conn.deadline <= now) s.abort(i, if (slot.conn.pending.items.len > 0) .@"write-timeout" else .@"idle-timeout");
         for (&s.pending, 0..) |*p, i| if (p.* != null and p.*.?.deadline <= now) {
             const u = p.*.?.upstream;
             log.event(.warn, "upstream-timeout", .{ .upstream = s.forwarding.?.upstreams[u], .qname = zone.fmt(p.*.?.qname()), .qtype = log.typeName(p.*.?.type) });
@@ -243,7 +243,7 @@ pub const Server = struct {
             switch (s.slots[ev.token]) {
                 .udp => |fd| s.serveUdp(fd),
                 .listener => |fd| s.accept(fd),
-                .conn => |*c| if (c.gen > born) {} else if (ev.fatal) s.close(ev.token) else s.serveTcp(ev.token, c),
+                .conn => |*c| if (c.gen > born) {} else if (ev.fatal) s.abort(ev.token, .@"error") else s.serveTcp(ev.token, c),
                 .scrape => |fd| s.scrape(fd),
                 .free => {},
             }
@@ -258,7 +258,10 @@ pub const Server = struct {
         const reply = if (engine.respond(s.arena.allocator(), ctx, packet, s.out[2..], a.proto, if (s.forwarding != null) &fwd else null)) |n|
             s.out[2 .. 2 + n]
         else
-            (s.forwardQuery((fwd orelse return null), to, a, &cache) orelse return null);
+            (s.forwardQuery((fwd orelse {
+                s.metrics.drop(a.proto, if (packet.len < 12) .short else .response);
+                return null;
+            }), to, a, &cache) orelse return null);
         s.answered(a, packet, reply, cache);
         return reply;
     }
@@ -430,7 +433,7 @@ pub const Server = struct {
                 c.waiting = false;
                 if (c.pending.items.len == 0) {
                     s.poller.set(c.fd, w.to.tcp.token, .read) catch {
-                        s.close(w.to.tcp.token);
+                        s.abort(w.to.tcp.token, .@"error");
                         continue;
                     };
                     s.frames(w.to.tcp.token, c);
@@ -482,12 +485,13 @@ pub const Server = struct {
             if (slot == .free) break i;
         } else {
             log.event(.warn, "tcp-refused", .{ .reason = "connection-cap" });
+            s.metrics.tcpClose(.@"connection-cap");
             _ = sys.close(cfd);
             return;
         };
         s.next_gen += 1;
         s.slots[slot] = .{ .conn = .{ .fd = cfd, .peer = peer, .gen = s.next_gen, .deadline = nowMs() + idle_timeout_ms } };
-        s.poller.add(cfd, slot) catch s.close(slot);
+        s.poller.add(cfd, slot) catch s.abort(slot, .@"error");
     }
 
     fn serveTcp(s: *Server, token: usize, c: *Conn) void {
@@ -498,10 +502,11 @@ pub const Server = struct {
         switch (posix.errno(rc)) {
             .SUCCESS => {},
             .AGAIN, .INTR => return,
-            else => return s.close(token),
+            else => return s.abort(token, .@"error"),
         }
         const n: usize = @intCast(rc);
         if (n == 0) { // the client is done asking; an incomplete last frame is dropped
+            if (c.len > 0) s.metrics.tcpClose(.@"truncated-frame");
             c.eof = true;
             return s.settle(token);
         }
@@ -516,12 +521,12 @@ pub const Server = struct {
             // A forwarded reply can fill the output queue even after read readiness is paused.
             if (s.awaited(token, c.gen)) {
                 c.waiting = true;
-                s.poller.set(c.fd, token, .none) catch s.close(token);
+                s.poller.set(c.fd, token, .none) catch s.abort(token, .@"error");
                 return;
             }
             const end = frameEnd(c.buf[0..c.len]) orelse return;
             c.messages += 1;
-            if (c.messages > max_messages_per_conn) return s.close(token);
+            if (c.messages > max_messages_per_conn) return s.abort(token, .@"message-cap");
             c.deadline = nowMs() + idle_timeout_ms;
             if (s.respond(c.buf[2..end], .{ .tcp = .{ .token = token, .gen = c.gen } }, .{ .proto = .tcp, .client = c.peer, .start = nowNs() })) |reply| s.send(token, reply);
             // The answer, or a SERVFAIL delivered while forwarding, may have closed this connection.
@@ -539,26 +544,26 @@ pub const Server = struct {
         std.mem.writeInt(u16, s.out[0..2], @intCast(reply.len), .big);
         var data: []const u8 = s.out[0 .. 2 + reply.len];
         if (c.pending.items.len == 0) {
-            data = data[sendSome(c.fd, data) orelse return s.close(token) ..];
+            data = data[sendSome(c.fd, data) orelse return s.abort(token, .@"error") ..];
             if (data.len == 0) {
                 c.deadline = nowMs() + idle_timeout_ms;
                 return;
             }
             c.deadline = nowMs() + write_timeout_ms;
-            s.poller.set(c.fd, token, .write) catch return s.close(token);
+            s.poller.set(c.fd, token, .write) catch return s.abort(token, .@"error");
         }
-        if (c.pending.items.len + data.len > max_pending_output) return s.close(token);
-        c.pending.appendSlice(s.gpa, data) catch return s.close(token);
+        if (c.pending.items.len + data.len > max_pending_output) return s.abort(token, .@"output-full");
+        c.pending.appendSlice(s.gpa, data) catch return s.abort(token, .@"error");
     }
 
     /// Write readiness: sends what is pending, then reads again (or settles after an EOF).
     fn flush(s: *Server, token: usize, c: *Conn) void {
-        const sent = sendSome(c.fd, c.pending.items) orelse return s.close(token);
+        const sent = sendSome(c.fd, c.pending.items) orelse return s.abort(token, .@"error");
         c.pending.replaceRangeAssumeCapacity(0, sent, &.{});
         if (c.pending.items.len > 0) return;
         c.deadline = nowMs() + idle_timeout_ms;
         if (c.eof) return s.settle(token);
-        s.poller.set(c.fd, token, .read) catch return s.close(token);
+        s.poller.set(c.fd, token, .read) catch return s.abort(token, .@"error");
         s.frames(token, c);
     }
 
@@ -567,7 +572,7 @@ pub const Server = struct {
         const c = &s.slots[token].conn;
         if (c.pending.items.len > 0) return; // `flush` settles again
         if (!s.awaited(token, c.gen)) return s.close(token);
-        s.poller.set(c.fd, token, .none) catch s.close(token);
+        s.poller.set(c.fd, token, .none) catch s.abort(token, .@"error");
     }
 
     /// One `GET /metrics` (ADR 0011), answered on the spot and closed.
@@ -609,6 +614,12 @@ pub const Server = struct {
         }) catch unreachable;
         sendAll(fd, h, deadline) catch return;
         sendAll(fd, body.written(), deadline) catch return;
+    }
+
+    /// Closes connection `token` before its client was done, counted by reason.
+    fn abort(s: *Server, token: usize, reason: metrics.TcpClose) void {
+        s.metrics.tcpClose(reason);
+        s.close(token);
     }
 
     fn close(s: *Server, token: usize) void {
@@ -1140,6 +1151,39 @@ test "a client that does not read stalls only its own connection, within a total
     c.deadline = 0;
     try l.server.step(0);
     try testing.expectEqual(@as(usize, 0), l.conns());
+    try testing.expectEqual(@as(u64, 1), l.server.metrics.tcp_closes[@intFromEnum(metrics.TcpClose.@"write-timeout")]);
+}
+
+test "abnormal ends are counted: idle timeout, short and response messages over UDP" {
+    const l = try Loopback.init(testing.allocator, .{});
+    defer l.deinit();
+    const m = &l.server.metrics;
+    const idle = try l.connect();
+    defer _ = sys.close(idle);
+    while (l.conns() == 0) try l.server.step(0);
+    for (l.server.slots) |*slot| if (slot.* == .conn) {
+        slot.conn.deadline = 0;
+    };
+    try l.server.step(0);
+    try testing.expectEqual(@as(usize, 0), l.conns());
+    try testing.expectEqual(@as(u64, 1), m.tcp_closes[@intFromEnum(metrics.TcpClose.@"idle-timeout")]);
+    try testing.expectEqual(@as(u64, 0), m.tcp_closes[@intFromEnum(metrics.TcpClose.@"write-timeout")]);
+
+    const udp = try clientSocket(l.udp_addr, posix.SOCK.DGRAM);
+    defer _ = sys.close(udp);
+    var storage: PosixAddress = undefined;
+    const len = sockaddr(l.udp_addr, &storage);
+    var qbuf: [512]u8 = undefined;
+    const end = queryFrame(&qbuf, 7, "hub.kekkai.uchi.example.org.", .a).len;
+    qbuf[4] |= 0x80; // QR: a response
+    const response = qbuf[2..end];
+    for ([_][]const u8{ "\x00\x01\x00", response }) |p| _ = sys.sendto(udp, p.ptr, p.len, 0, &storage.any, len);
+    for (0..1000) |_| {
+        try l.server.step(0);
+        if (m.dropped[0][0] + m.dropped[0][1] == 2) break;
+    }
+    try testing.expectEqual([2]u64{ 1, 1 }, m.dropped[@intFromEnum(metrics.Proto.udp)]);
+    try testing.expectEqual(@as(u64, 0), m.queries[0][0][0]); // no answer, so no query counted
 }
 
 test "the TCP connection cap is 64 with and without the metrics listener (review A13)" {
@@ -1153,6 +1197,7 @@ test "the TCP connection cap is 64 with and without the metrics listener (review
         };
         for (0..4 * clients.len) |_| try l.server.step(0);
         try testing.expectEqual(@as(usize, max_conns), l.conns());
+        try testing.expectEqual(@as(u64, 1), l.server.metrics.tcp_closes[@intFromEnum(metrics.TcpClose.@"connection-cap")]);
     }
 }
 
@@ -1466,6 +1511,11 @@ test "TCP framing and connection state under random streams split at random poin
         for (0..count) |i| len += queryFrame(buf[len..], @intCast(i), "hub.kekkai.uchi.example.org.", .a).len;
         try l.checkStream(buf[0..len], r);
     }
+    // Each way a stream goes wrong above was counted.
+    const m = &l.server.metrics;
+    try testing.expect(m.tcp_closes[@intFromEnum(metrics.TcpClose.@"message-cap")] > 0);
+    try testing.expect(m.tcp_closes[@intFromEnum(metrics.TcpClose.@"truncated-frame")] > 0);
+    for (m.dropped[@intFromEnum(metrics.Proto.tcp)]) |n| try testing.expect(n > 0);
 }
 
 test "review A14: entropy retries interruptions and short reads, fails closed" {

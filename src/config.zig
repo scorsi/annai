@@ -529,6 +529,19 @@ test "every invalid zone is rejected" {
     }
 }
 
+test "a type named in wire.Type is not a zone record type unless the parser lists it (ADR 0003)" {
+    inline for (@typeInfo(wire.Type).@"enum".fields) |f| {
+        const listed = comptime for (record_types) |t| {
+            if (std.mem.eql(u8, t, f.name)) break true;
+        } else false;
+        if (!listed) {
+            const text = try mutate("txt = [\"v=spf1 -all\"]", f.name ++ " = [\"x\"]");
+            defer testing.allocator.free(text);
+            try expectZone(text, "unknown key \"" ++ f.name ++ "\"");
+        }
+    }
+}
+
 fn expectConfig(text: []const u8, want: ?[]const u8) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

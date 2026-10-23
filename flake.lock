@@ -85,11 +85,11 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1792517727,
-        "narHash": "sha256-s3k2vMEq6gWB2Vw3zAPolUbCsOF6Es9wzJBw/Zgv0SM=",
+        "lastModified": 1792780075,
+        "narHash": "sha256-9jKsQiRGmw8jqUtG/ogPXxgw2vD0vAvAMtdKzbJcfA8=",
         "ref": "refs/heads/main",
-        "rev": "0ac2136b58993636b1a471dae2482b48f608ff01",
-        "revCount": 15,
+        "rev": "2860f1950c16f140fa71a8386ff49ffa70f032b9",
+        "revCount": 41,
         "type": "git",
         "url": "ssh://git@forgejo.uchi.scorsi.dev:2222/scorsi/masu.git"
       },
@@ -107,11 +107,11 @@
         "treefmt-nix": "treefmt-nix_2"
       },
       "locked": {
-        "lastModified": 1792517735,
-        "narHash": "sha256-NftySqo4kOWFqaQtM3W01RbmgJrhfJ4x/0R9dMmBMos=",
+        "lastModified": 1792702252,
+        "narHash": "sha256-TsyLv2fKnqeclGKDnc2QgvGER+ZuHzaSOQ2jEa60IeE=",
         "ref": "refs/heads/main",
-        "rev": "ee4a22128dff66ffd993867e047a7819a74a675e",
-        "revCount": 15,
+        "rev": "0577322fcde6a3c1abe2c33f2f65c6ce82c0454c",
+        "revCount": 42,
         "type": "git",
         "url": "ssh://git@forgejo.uchi.scorsi.dev:2222/scorsi/nisshi.git"
       },

@@ -23,6 +23,8 @@ pub const Update = enum { ok, refused, notauth, @"error" };
 pub const TcpClose = enum { @"connection-cap", @"idle-timeout", @"write-timeout", @"message-cap", @"output-full", @"truncated-frame", @"error" };
 /// A message that gets no answer at all: shorter than a header, or itself a response.
 pub const Drop = enum { short, response };
+/// A SIGHUP reload of zones and keys (ADR 0011): applied, or refused with the old state kept.
+pub const Reload = enum { ok, failed };
 
 pub const Metrics = struct {
     /// [proto][qtype, `other` last][rcode, BADVERS then `other` last]
@@ -38,6 +40,7 @@ pub const Metrics = struct {
     tcp_closes: [std.enums.values(TcpClose).len]u64 = @splat(0),
     /// [proto][reason]
     dropped: [2][std.enums.values(Drop).len]u64 = @splat(@splat(0)),
+    reloads: [std.enums.values(Reload).len]u64 = @splat(0),
 
     pub fn init(gpa: std.mem.Allocator, n_upstreams: usize, n_keys: usize) !Metrics {
         const m: Metrics = .{ .upstreams = try gpa.alloc([4]u64, n_upstreams), .updates = try gpa.alloc([4]u64, n_keys + 1) };
@@ -75,6 +78,22 @@ pub const Metrics = struct {
 
     pub fn drop(m: *Metrics, proto: Proto, reason: Drop) void {
         m.dropped[@intFromEnum(proto)][@intFromEnum(reason)] +|= 1;
+    }
+
+    pub fn reload(m: *Metrics, result: Reload) void {
+        m.reloads[@intFromEnum(result)] +|= 1;
+    }
+
+    /// Follows a reload from key set `old` to `new`: a key kept by name keeps its counts, `none`
+    /// keeps its own, a removed key's series goes away (ADR 0011: counters survive a reload).
+    pub fn rekey(m: *Metrics, gpa: std.mem.Allocator, old: []const tsig.Key, new: []const tsig.Key) !void {
+        const rows = try gpa.alloc([4]u64, new.len + 1);
+        for (new, rows[0..new.len]) |k, *row| row.* = for (old, 0..) |o, i| {
+            if (std.mem.eql(u8, o.name, k.name)) break m.updates[i];
+        } else @splat(0);
+        rows[new.len] = m.updates[old.len];
+        gpa.free(m.updates);
+        m.updates = rows;
     }
 
     pub fn upstream(m: *Metrics, i: usize, result: Upstream) void {
@@ -150,6 +169,9 @@ pub fn write(m: *const Metrics, info: Info, w: *Writer) Writer.Error!void {
     try head(w, "annai_tcp_closes_total", "counter", "TCP connections annai refused or ended before the client was done, by reason.");
     for (m.tcp_closes, 0..) |n, r| try w.print("annai_tcp_closes_total{{reason=\"{s}\"}} {d}\n", .{ @tagName(@as(TcpClose, @enumFromInt(r))), n });
 
+    try head(w, "annai_reloads_total", "counter", "SIGHUP reloads of zones and keys, by result (`failed` kept the previous ones).");
+    for (m.reloads, 0..) |n, r| try w.print("annai_reloads_total{{result=\"{s}\"}} {d}\n", .{ @tagName(@as(Reload, @enumFromInt(r))), n });
+
     try head(w, "annai_cache_entries", "gauge", "Answers in the forwarding cache.");
     try w.print("annai_cache_entries {d}\n", .{info.cache_entries});
     try head(w, "annai_cache_lookups_total", "counter", "Forwarded queries looked up in the cache, by result.");
@@ -208,6 +230,7 @@ test "exposition: closed label sets, cumulative buckets, escaped values" {
     m.drop(.udp, .short);
     m.tcpClose(.@"idle-timeout");
     m.upstream(0, .timeout);
+    m.reload(.failed);
     const keys = [_]tsig.Key{.{ .name = "\x05hanko\x00", .secret = "x" }};
     m.update(&keys, "\x05hanko\x00", .refused);
     m.update(&keys, "\x05other\x00", .notauth);
@@ -231,6 +254,8 @@ test "exposition: closed label sets, cumulative buckets, escaped values" {
         "annai_dropped_messages_total{proto=\"tcp\",reason=\"response\"} 0\n",
         "annai_tcp_closes_total{reason=\"idle-timeout\"} 1\n",
         "annai_tcp_closes_total{reason=\"connection-cap\"} 0\n",
+        "annai_reloads_total{result=\"ok\"} 0\n",
+        "annai_reloads_total{result=\"failed\"} 1\n",
         "annai_cache_entries 3\n",
         "annai_cache_lookups_total{result=\"hit\"} 1\n",
         "annai_upstream_queries_total{upstream=\"9.9.9.9:53\",result=\"timeout\"} 1\n",
@@ -243,7 +268,7 @@ test "exposition: closed label sets, cumulative buckets, escaped values" {
     };
     try testing.expect(std.mem.endsWith(u8, text, "\n"));
     // One HELP and one TYPE per family.
-    try testing.expectEqual(@as(usize, 10), std.mem.count(u8, text, "# TYPE "));
+    try testing.expectEqual(@as(usize, 11), std.mem.count(u8, text, "# TYPE "));
 }
 
 test "the summed duration saturates instead of trapping (review A15)" {
@@ -255,4 +280,19 @@ test "the summed duration saturates instead of trapping (review A15)" {
     m.queries[0][0][0] = std.math.maxInt(u64);
     m.query(.udp, qtypes[0], 0, 1);
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), m.queries[0][0][0]);
+}
+
+test "a reload keeps the counts of the keys it keeps and of `none`" {
+    var m = try Metrics.init(testing.allocator, 0, 2);
+    defer m.deinit(testing.allocator);
+    const old = [_]tsig.Key{ .{ .name = "\x01a\x00", .secret = "x" }, .{ .name = "\x01b\x00", .secret = "x" } };
+    m.update(&old, "\x01a\x00", .noerror);
+    m.update(&old, "\x01b\x00", .refused);
+    m.update(&old, null, .notauth);
+    const new = [_]tsig.Key{ .{ .name = "\x01c\x00", .secret = "y" }, .{ .name = "\x01b\x00", .secret = "y" } };
+    try m.rekey(testing.allocator, &old, &new);
+    try testing.expectEqual(@as(usize, 3), m.updates.len);
+    try testing.expectEqual([4]u64{ 0, 0, 0, 0 }, m.updates[0]);
+    try testing.expectEqual([4]u64{ 0, 1, 0, 0 }, m.updates[1]);
+    try testing.expectEqual([4]u64{ 0, 0, 1, 0 }, m.updates[2]);
 }

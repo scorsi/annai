@@ -139,13 +139,6 @@ pub const Server = struct {
     /// Upstream answers received over TCP.
     up: [2 + max_message]u8 = undefined,
 
-    /// Binds every address (UDP and TCP) and serves forever.
-    pub fn run(gpa: std.mem.Allocator, zones: []const zone.Zone, cfg: config.Config, keys: []const tsig.Key) !void {
-        const s = try init(gpa, zones, cfg, keys);
-        defer s.deinit();
-        while (true) try s.step(1000);
-    }
-
     /// Binds every address of `cfg`; `deinit` closes them.
     pub fn init(gpa: std.mem.Allocator, zones: []const zone.Zone, cfg: config.Config, keys: []const tsig.Key) !*Server {
         const listen = cfg.listen;
@@ -208,6 +201,15 @@ pub const Server = struct {
         s.cache.deinit();
         s.overlay.deinit();
         s.gpa.destroy(s);
+    }
+
+    /// Serves `zones` and `keys` from the next query on (SIGHUP, ADR 0011). Listeners, connections,
+    /// pending upstream queries, the cache, dynamic records and counters stay; nothing kept refers
+    /// to the old zones or keys, so the caller may free them once this returns.
+    pub fn reload(s: *Server, zones: []const zone.Zone, keys: []const tsig.Key) !void {
+        try s.metrics.rekey(s.gpa, s.keys, keys);
+        s.zones = zones;
+        s.keys = keys;
     }
 
     /// One turn of the event loop: waits up to `idle_ms` for events, handles them, then expires
@@ -1152,6 +1154,44 @@ test "a client that does not read stalls only its own connection, within a total
     try l.server.step(0);
     try testing.expectEqual(@as(usize, 0), l.conns());
     try testing.expectEqual(@as(u64, 1), l.server.metrics.tcp_closes[@intFromEnum(metrics.TcpClose.@"write-timeout")]);
+}
+
+test "reload: the next query sees the new zones, open connections and listeners stay (ADR 0011)" {
+    const l = try Loopback.init(testing.allocator, .{});
+    defer l.deinit();
+    const tcp = try l.connect();
+    defer _ = sys.close(tcp);
+    while (l.conns() == 0) try l.server.step(0);
+    const udp = try clientSocket(l.udp_addr, posix.SOCK.DGRAM);
+    defer _ = sys.close(udp);
+    var storage: PosixAddress = undefined;
+    const len = sockaddr(l.udp_addr, &storage);
+    var qbuf: [512]u8 = undefined;
+    const q = queryFrame(&qbuf, 9, "new.uchi.example.org.", .a)[2..];
+    var answer: [512]u8 = undefined;
+    var rcodes: [2]u4 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const keys = [_]tsig.Key{.{ .name = "\x05hanko\x00", .secret = "s" }};
+    for (&rcodes, 0..) |*rc, round| {
+        if (round == 1) {
+            var d: config.Diag = .{};
+            const zones = try arena.allocator().alloc(zone.Zone, 1);
+            zones[0] = try config.loadZone(arena.allocator(), engine.test_zone ++ "[names.\"new\"]\na = [\"192.0.2.9\"]\n", &d);
+            try l.server.reload(zones, &keys);
+            try testing.expectEqual(@as(usize, 2), l.server.metrics.updates.len);
+        }
+        _ = sys.sendto(udp, q.ptr, q.len, 0, &storage.any, len);
+        const n = for (0..1000) |_| {
+            try l.server.step(0);
+            const got = sys.recvfrom(udp, &answer, answer.len, 0, null, null);
+            if (posix.errno(got) == .SUCCESS) break @as(usize, @intCast(got));
+        } else return error.NoAnswer;
+        try testing.expect(n > 12);
+        rc.* = @truncate(answer[3]);
+    }
+    try testing.expectEqual([2]u4{ @intFromEnum(wire.Rcode.nxdomain), @intFromEnum(wire.Rcode.noerror) }, rcodes);
+    try testing.expectEqual(@as(usize, 1), l.conns());
 }
 
 test "abnormal ends are counted: idle timeout, short and response messages over UDP" {

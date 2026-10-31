@@ -176,10 +176,26 @@ in
       description = "annai DNS server (${cfg.mode} mode)";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
-      # ADR 0011 v0: a configuration change restarts the service (reload is M5).
-      restartTriggers = [ cfg.configFile ];
+      # ADR 0011 (M5): a change of zones only reloads (SIGHUP, same process, sockets kept);
+      # anything annai cannot reload restarts it. Adding or removing a key changes LoadCredential,
+      # hence the unit itself: that restarts too.
+      restartTriggers = [
+        (builtins.toJSON {
+          inherit (cfg) mode listen;
+          forwarding = { inherit (cfg.forwarding) upstreams maxTtl cacheBytes; };
+          update = { inherit (cfg.update) maxTtl lifetime; };
+          metrics = cfg.metrics.listen;
+        })
+      ];
+      reloadTriggers = [ cfg.configFile ];
       serviceConfig = {
-        ExecStart = "${lib.getExe cfg.package} serve ${cfg.configFile}";
+        # Active once every listener is bound and every zone loaded; `systemctl reload` sends
+        # SIGHUP and waits for the reload to finish (RELOADING=1 then READY=1).
+        Type = "notify-reload";
+        # A stable path: the reload re-reads it after activation has pointed it at the new file.
+        ExecStart = "${lib.getExe cfg.package} serve /etc/annai/annai.toml";
+        # A rotated secret file reaches the unit on reload too, not only on restart.
+        RefreshOnReload = "credentials";
         Restart = "on-failure";
         RestartSec = "2s";
         # TSIG secrets stay root-owned on disk; systemd hands them to the dynamic user (ADR 0006).
@@ -204,6 +220,7 @@ in
         RestrictAddressFamilies = [
           "AF_INET"
           "AF_INET6"
+          "AF_UNIX" # NOTIFY_SOCKET
         ];
         RestrictNamespaces = true;
         RestrictRealtime = true;

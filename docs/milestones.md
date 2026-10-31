@@ -50,7 +50,7 @@ Each milestone ends with a passing nixosTest (ADR-0011). Versions: v0 = internal
 
 ## M5 — Operations (v1.1)
 
-- `SIGHUP` atomic reload of zones and keys; `Type=notify` readiness.
+- `SIGHUP` atomic reload of zones and keys; `Type=notify` readiness (code done 2026-10-31 as `Type=notify-reload`, ADR-0011 amendment; nixosTest `reload` awaits its builder run).
 - Prometheus metrics endpoint on a loopback listener, scraped by the local agent (ADR-0011 amendment; done ahead of M5 with the JSON logs).
 - `ns1` and `ns2` on two separate hosts, deployed in one run.
 - Done when: `ns2` answers from a second host and the metrics are scraped.

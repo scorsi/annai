@@ -5,6 +5,7 @@ const server = @import("server.zig");
 const tsig = @import("tsig.zig");
 const wire = @import("wire.zig");
 const log = @import("log.zig");
+const notify = @import("notify.zig");
 
 // Printed only for a wrong command line, which the unit's fixed `annai serve <path>` never is.
 const usage = "usage: annai check <annai.toml> | annai serve <annai.toml>\n";
@@ -30,10 +31,89 @@ fn run(init: std.process.Init) !void {
         std.debug.print(usage, .{});
         std.process.exit(2);
     }
+    // Before anything can make systemd send it: SIGHUP's default action ends the process.
+    const on_hup: std.posix.Sigaction = .{ .handler = .{ .handler = onHup }, .mask = std.posix.sigemptyset(), .flags = std.posix.SA.RESTART };
+    std.posix.sigaction(.HUP, &on_hup, null);
     // Secrets are read only to serve: at build time `annai check` sees the paths, not the files.
     const keys = if (loaded.config.update) |u| try loadKeys(init.io, init.arena.allocator(), u.keys) else &.{};
     // shortcut: a GeneralPurposeAllocator in debug builds (ADR 0001) waits for a reason to look for leaks.
-    try server.Server.run(std.heap.smp_allocator, loaded.zones, loaded.config, keys);
+    const gpa = std.heap.smp_allocator;
+    const s = try server.Server.init(gpa, loaded.zones, loaded.config, keys);
+    defer s.deinit();
+    // Type=notify-reload (ADR 0011): active once every listener is bound and every zone loaded.
+    const notify_socket = init.environ_map.get("NOTIFY_SOCKET");
+    notify.send(notify_socket, "READY=1");
+    // The first generation lives in the process arena; each reload gets its own, freed by the next.
+    var current: ?State = null;
+    defer if (current) |*c| c.arena.deinit();
+    while (true) {
+        // shortcut: the poller retries on EINTR, so a SIGHUP waits for the next wake (at most
+        // ~1 s); systemd waits for READY=1 anyway.
+        try s.step(1000);
+        if (!hup.swap(false, .acq_rel)) continue;
+        var b: [64]u8 = undefined;
+        notify.send(notify_socket, notify.reloading(&b));
+        // One query is answered entirely on one state: the loop is single-threaded (ADR 0001).
+        if (reread(init.io, gpa, args[2], loaded.config, s)) |next| {
+            if (current) |*c| c.arena.deinit();
+            current = next;
+            s.metrics.reload(.ok);
+            log.event(.info, "reload", .{ .zones = next.zones.len, .keys = next.keys.len });
+        } else |e| {
+            s.metrics.reload(.failed);
+            log.event(.@"error", "reload-failed", .{ .err = if (e == error.Reported) "invalid configuration, previous zones and keys kept" else @errorName(e) });
+        }
+        notify.send(notify_socket, "READY=1");
+    }
+}
+
+var hup = std.atomic.Value(bool).init(false);
+
+fn onHup(_: std.posix.SIG) callconv(.c) void {
+    hup.store(true, .release);
+}
+
+/// One reloaded generation of zones and keys, in its own arena.
+const State = struct { arena: std.heap.ArenaAllocator, zones: []const zone.Zone, keys: []const tsig.Key };
+
+/// Re-reads `path` and its zones and key files, and hands them to `s` (ADR 0003, ADR 0011). Only
+/// zones and update keys reload: any other difference from `running` needs a restart. On error
+/// nothing changed and the reason is already logged when it is `error.Reported`.
+fn reread(io: std.Io, gpa: std.mem.Allocator, path: []const u8, running: config.Config, s: *server.Server) !State {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const loaded = try load(io, a, path);
+    if (!eql(restartOnly(loaded.config), restartOnly(running)))
+        return fail("config-invalid", "{s}: only zones and update keys reload; restart annai to apply other changes", .{path});
+    const keys = if (loaded.config.update) |u| try loadKeys(io, a, u.keys) else &.{};
+    try s.reload(loaded.zones, keys);
+    return .{ .arena = arena, .zones = loaded.zones, .keys = keys };
+}
+
+/// `c` without what a reload may change.
+fn restartOnly(c: config.Config) config.Config {
+    var r = c;
+    r.zones = &.{};
+    if (r.update) |*u| u.keys = &.{};
+    return r;
+}
+
+/// Deep equality of configuration values: slices by content.
+fn eql(a: anytype, b: @TypeOf(a)) bool {
+    switch (@typeInfo(@TypeOf(a))) {
+        .pointer => {
+            if (a.len != b.len) return false;
+            for (a, b) |x, y| if (!eql(x, y)) return false;
+            return true;
+        },
+        .optional => return if (a) |x| (if (b) |y| eql(x, y) else false) else b == null,
+        .@"struct" => |s| {
+            inline for (s.fields) |f| if (!eql(@field(a, f.name), @field(b, f.name))) return false;
+            return true;
+        },
+        else => return std.meta.eql(a, b),
+    }
 }
 
 /// Reads the TSIG secrets (ADR 0006). A key file holds one line: the base64 secret, optionally
@@ -113,6 +193,7 @@ test {
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = @import("metrics.zig");
+    _ = notify;
 }
 
 test "key files: bare base64 or hanko's name:base64, same key only" {
@@ -135,4 +216,51 @@ test "a refused check is one schema v1 error line" {
     try std.testing.expectEqualStrings(
         \\{"v":1,"ts":"1970-01-01T00:00:00.000000000Z","level":"error","event":"config-invalid","err":"/nix/store/x-annai.toml: metrics: \"0.0.0.0:9153\" is not loopback"}
     ++ "\n", w.buffered());
+}
+
+test "reread: zones and keys are swapped in; an invalid file or a restart-only change keeps the old ones (ADR 0011)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const engine = @import("engine.zig");
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/annai.toml", .{tmp.sub_path});
+    try tmp.dir.writeFile(io, .{ .sub_path = "hanko.key", .data = "hanko:c2VjcmV0\n" });
+    const key_path = try tmp.dir.realPathFileAlloc(io, "hanko.key", a);
+    const toml = "mode = \"soto\"\nlisten = [\"192.0.2.1:53\"]\nzones = [\"zone.toml\"]\n[[update.keys]]\nname = \"hanko\"\nsecret_file = \"{s}\"\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "annai.toml", .data = try std.fmt.allocPrint(a, toml, .{key_path}) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "zone.toml", .data = engine.test_zone });
+    const running = (try load(io, a, path)).config;
+
+    const l = try server.Loopback.init(std.testing.allocator, .{});
+    defer l.deinit();
+    var first = try reread(io, std.testing.allocator, path, running, l.server);
+    defer first.arena.deinit();
+    try std.testing.expectEqual(first.zones.ptr, l.server.zones.ptr);
+    try std.testing.expectEqualStrings("secret", l.server.keys[0].secret);
+
+    // A rotated secret and a new name.
+    const zone2 = engine.test_zone ++ "[names.\"new\"]\na = [\"192.0.2.9\"]\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "hanko.key", .data = "b3RoZXI=" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "zone.toml", .data = zone2 });
+    var second = try reread(io, std.testing.allocator, path, running, l.server);
+    defer second.arena.deinit();
+    try std.testing.expectEqualStrings("other", l.server.keys[0].secret);
+    try std.testing.expect(l.server.zones[0].names.contains("\x03new\x04uchi\x07example\x03org\x00"));
+
+    // Each of these leaves the second generation in place.
+    const broken = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "zone.toml", engine.test_zone ++ "[names.\"bad\"]\ncname = \"a\"\na = [\"192.0.2.1\"]\n", zone2 },
+        .{ "hanko.key", "!!!!", "b3RoZXI=" },
+        .{ "annai.toml", try std.fmt.allocPrint(a, "mode = \"soto\"\nlisten = [\"192.0.2.2:53\"]\nzones = [\"zone.toml\"]\n[[update.keys]]\nname = \"hanko\"\nsecret_file = \"{s}\"\n", .{key_path}), "" },
+    };
+    for (broken) |b| {
+        try tmp.dir.writeFile(io, .{ .sub_path = b[0], .data = b[1] });
+        defer if (b[2].len > 0) tmp.dir.writeFile(io, .{ .sub_path = b[0], .data = b[2] }) catch {};
+        try std.testing.expectError(error.Reported, reread(io, std.testing.allocator, path, running, l.server));
+        try std.testing.expectEqual(second.zones.ptr, l.server.zones.ptr);
+        try std.testing.expectEqualStrings("other", l.server.keys[0].secret);
+    }
 }

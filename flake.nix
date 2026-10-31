@@ -196,6 +196,7 @@
             authoritative = import ./nix/test-authoritative.nix { inherit self pkgs validate; };
             forwarding = import ./nix/test-forwarding.nix { inherit self pkgs validate; };
             update = import ./nix/test-update.nix { inherit self pkgs validate; };
+            reload = import ./nix/test-reload.nix { inherit self pkgs validate; };
           }
         )
       );

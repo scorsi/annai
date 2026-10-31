@@ -1,6 +1,6 @@
 # ADR-0011: Testing and operations
 
-- Status: accepted, amended 2026-10-20 (logs and metrics, below), amended 2026-10-22 (CI builds each check separately, below), amended 2026-10-24 (named query types, drop and TCP close counters, in the metrics section)
+- Status: accepted, amended 2026-10-20 (logs and metrics, below), amended 2026-10-22 (CI builds each check separately, below), amended 2026-10-24 (named query types, drop and TCP close counters, in the metrics section), amended 2026-10-31 (reload and readiness, below)
 - Date: 2026-10-14
 
 ## Context
@@ -123,3 +123,42 @@ key=value logs" of v0 and the metrics bullet of v1; the rest of the decision sta
 - Flake checks: `module-metrics` renders a listener, `module-metrics-public` must fail
   `annai check`, `module-metrics-assertion` evaluates the module's assertion.
 
+
+## Amendment (2026-10-31): reload and readiness (M5)
+
+How the v1 bullet "`SIGHUP` reloads zones and keys atomically; `Type=notify` readiness" is built.
+
+- **What reloads**: `SIGHUP` re-reads the same `annai.toml`, every zone file and every key file,
+  and validates all of it as a start would. Only the zone list and `[[update.keys]]` may differ
+  from the running configuration; any other difference (`mode`, `listen`, `[forwarding]`,
+  `metrics`, `update.max_ttl`, `update.lifetime`) refuses the reload, since it needs new sockets
+  or a new cache. On any error nothing changes: the previous zones and keys keep serving.
+- **Atomic swap**: the new zones and keys live in their own arena; the loop (single-threaded,
+  ADR 0001) swaps them between two events, so every query is answered entirely on one state, and
+  frees the previous generation. Listeners, TCP connections, pending upstream queries, the cache,
+  the dynamic records (ADR 0006) and the counters stay. A key kept by name keeps its
+  `annai_updates_total` series; a removed key's series goes away.
+- **Logs**: `reload` (`info`, `zones` and `keys` = how many are now loaded) on success; on failure
+  the line a refused start writes (`config-invalid`, `read-failed`, `key-invalid`, with the path)
+  then `reload-failed` (`error`). **Metric**: `annai_reloads_total{result=ok|failed}`, both
+  series written from the start.
+- **systemd**: `Type=notify-reload` (systemd 253+; the pinned nixpkgs has 260) rather than
+  `Type=notify` plus an `ExecReload=kill -HUP`, which would return before the reload is done.
+  annai sends `READY=1` once every listener is bound and every zone loaded, and on `SIGHUP`
+  `RELOADING=1` with `MONOTONIC_USEC=`, then `READY=1` whether the reload succeeded or not (the
+  protocol has no way to fail a reload: the log line and the counter say it). sd_notify is one
+  datagram on the `NOTIFY_SOCKET` AF_UNIX socket, written with the standard library; the unit
+  allows `AF_UNIX` for it. Without `NOTIFY_SOCKET` nothing is sent.
+- **NixOS module**: `ExecStart` reads the stable `/etc/annai/annai.toml`, `reloadTriggers` is the
+  rendered `annai.toml` and `restartTriggers` the settings annai cannot reload, so a deploy that
+  only changes zones reloads the running process and any other change restarts it (adding or
+  removing a key changes `LoadCredential`, hence the unit, and restarts too). This replaces the
+  v0 "configuration changes restart the service". `RefreshOnReload=credentials` hands a rotated
+  key file to the unit on reload; a deployment whose secret changes outside the annai options
+  adds that secret to the unit's `reloadTriggers` itself.
+- **Tests**: unit tests for the swap through a live loopback server, the re-read (valid set
+  swapped in; broken zone, broken key file or a restart-only change refused with the old state
+  kept), the key-row bookkeeping of the counters and the sd_notify datagrams; the nixosTest
+  `reload` (`Type=notify-reload`, a query answered as soon as `systemctl restart` returns, a
+  zone change deployed by `switch-to-configuration` served by the same `MainPID`, a rotated key
+  picked up by `systemctl reload`, a broken zone file refused with the previous answers kept).
